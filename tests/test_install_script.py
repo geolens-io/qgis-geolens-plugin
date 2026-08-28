@@ -36,6 +36,19 @@ def test_falls_back_to_qgis3_when_no_profile_exists(fake_home):
     assert "QGIS3" in str(install.default_plugin_dir())
 
 
+def test_reports_a_found_profile_without_a_plugins_directory(fake_home):
+    """A fresh profile has no python/plugins yet; that is not a wrong profile."""
+    (settings_root(fake_home) / "QGIS4/profiles/default").mkdir(parents=True)
+    plugin_dir, found_profile = install.detect_plugin_dir()
+    assert found_profile is True
+    assert not plugin_dir.exists()
+
+
+def test_reports_no_profile_when_none_exists(fake_home):
+    _, found_profile = install.detect_plugin_dir()
+    assert found_profile is False
+
+
 def test_windows_root_honors_appdata(monkeypatch, tmp_path):
     monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setenv("APPDATA", str(tmp_path / "Roaming"))
