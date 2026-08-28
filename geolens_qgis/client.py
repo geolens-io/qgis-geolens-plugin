@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Iterable
 from urllib.error import HTTPError
 from urllib.parse import quote, urlencode, urljoin, urlparse, urlunparse
@@ -12,6 +13,25 @@ from urllib.request import Request, urlopen
 
 class GeoLensError(RuntimeError):
     pass
+
+
+def _plugin_version() -> str:
+    """Version from metadata.txt, the same single source package_plugin.py reads."""
+    try:
+        metadata = Path(__file__).with_name("metadata.txt").read_text(encoding="utf-8")
+    except OSError:
+        return "unknown"
+    for line in metadata.splitlines():
+        if line.startswith("version="):
+            return line.split("=", 1)[1].strip() or "unknown"
+    return "unknown"
+
+
+# Sent on every request. Without it, urllib announces itself as
+# "Python-urllib/x.y", which common WAF/bot-mitigation rules block outright
+# with 403 before the request reaches GeoLens; a named agent also lets server
+# operators recognize plugin traffic in their logs.
+USER_AGENT = f"qgis-geolens-plugin/{_plugin_version()}"
 
 
 @dataclass(frozen=True)
@@ -58,6 +78,7 @@ class GeoLensClient:
             else self.base_url + path_or_url
         )
         headers = dict(self.headers)
+        headers["User-Agent"] = USER_AGENT
         data = None
         if body is not None:
             data = json.dumps(body, separators=(",", ":")).encode("utf-8")

@@ -31,6 +31,15 @@ class Recorder:
 
 
 class ClientTests(unittest.TestCase):
+    def test_sends_identifying_user_agent(self):
+        recorder = Recorder([{"features": []}])
+        client = GeoLensClient("example.com", opener=recorder)
+        client.search()
+        agent = recorder.requests[0].get_header("User-agent")
+        self.assertIsNotNone(agent)
+        self.assertTrue(agent.startswith("qgis-geolens-plugin/"))
+        self.assertNotIn("Python-urllib", agent)
+
     def test_normalizes_url_and_sends_api_key(self):
         recorder = Recorder([{"features": []}])
         client = GeoLensClient(" example.com/ ", "secret", recorder)
