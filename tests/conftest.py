@@ -81,7 +81,10 @@ def _install_qgis_stub():
         "QgsRectangle",
         "QgsRenderContext",
         "QgsSimpleMarkerSymbolLayerBase",
+        "QgsTask",
+        "QgsVectorFileWriter",
         "QgsVectorLayer",
+        "QgsVectorLayerFeatureSource",
         "QgsVectorTileLayer",
     ):
         setattr(core, name, _Placeholder)
