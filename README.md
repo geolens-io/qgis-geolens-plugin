@@ -45,10 +45,11 @@ python install.py --plugin-dir /path/to/profile/python/plugins
 
 GeoLens writes are per-feature and are not transactional. The plugin reports partial failures and requires confirmation before deleting server features. API keys are stored only in the local QGIS profile settings and are never written to project layer properties.
 
-Private raster tiles need a QGIS Authentication configuration capable of adding
-an `X-Api-Key` request header. The initial release deliberately does not embed
-API keys in raster layer source URLs, because QGIS serializes those URLs into
-project files.
+Private vector and raster tiles load with a short-lived signed token that the
+plugin renews while the layer is open. No API key is written into a layer
+source URL. A saved project keeps the last token, which expires within minutes,
+so a reopened project shows private tiles again once you re-add the layer from
+the GeoLens panel.
 
 ## Development
 

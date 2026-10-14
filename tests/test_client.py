@@ -3,7 +3,12 @@ import unittest
 from io import BytesIO
 from urllib.parse import parse_qs, urlparse
 
-from geolens_qgis.client import GeoLensClient, parse_dataset
+from geolens_qgis.client import (
+    GeoLensClient,
+    parse_dataset,
+    parse_tile_scope,
+    refresh_delay_seconds,
+)
 
 
 class Response:
@@ -31,6 +36,15 @@ class Recorder:
 
 
 class ClientTests(unittest.TestCase):
+    def test_sends_identifying_user_agent(self):
+        recorder = Recorder([{"features": []}])
+        client = GeoLensClient("example.com", opener=recorder)
+        client.search()
+        agent = recorder.requests[0].get_header("User-agent")
+        self.assertIsNotNone(agent)
+        self.assertTrue(agent.startswith("qgis-geolens-plugin/"))
+        self.assertNotIn("Python-urllib", agent)
+
     def test_normalizes_url_and_sends_api_key(self):
         recorder = Recorder([{"features": []}])
         client = GeoLensClient(" example.com/ ", "secret", recorder)
@@ -79,6 +93,60 @@ class ClientTests(unittest.TestCase):
         self.assertIn("/api/tiles/data.roads/{z}/{x}/{y}.pbf?", source["url"])
         self.assertEqual(parse_qs(urlparse(source["url"]).query)["sig"], ["abc"])
         self.assertIn("id%20with%20space", recorder.requests[0].full_url)
+
+    def test_vector_tile_source_strips_partition_and_tenant_from_the_path(self):
+        for scope, table in (
+            ("roads:p3", "roads"),
+            ("tenant_a:roads:p3", "roads"),
+            ("roads", "roads"),
+        ):
+            with self.subTest(scope=scope):
+                recorder = Recorder(
+                    [{"kind": "vector", "sig": "abc", "exp": 42, "scope": scope}]
+                )
+                source = GeoLensClient(
+                    "https://example.com", opener=recorder
+                ).tile_source("d")
+                url = urlparse(source["url"])
+                query = parse_qs(url.query)
+                self.assertEqual(
+                    url.path, f"/api/tiles/data.{table}/{{z}}/{{x}}/{{y}}.pbf"
+                )
+                self.assertEqual(source["source_layer"], f"data.{table}")
+                self.assertEqual(query["scope"], [scope])
+                self.assertEqual(query.get("pv"), ["3"] if ":p3" in scope else None)
+
+    def test_parses_tile_scopes(self):
+        self.assertEqual(parse_tile_scope("roads:p3"), ("roads", "3"))
+        self.assertEqual(parse_tile_scope("t:roads:p12"), ("roads", "12"))
+        self.assertEqual(parse_tile_scope("roads"), ("roads", None))
+
+    def test_refresh_follows_each_tokens_lifetime(self):
+        # Tokens last from 61 seconds to 16 minutes; a fixed interval would
+        # let the shortest one expire before it is renewed.
+        self.assertLess(refresh_delay_seconds(61), 61)
+        self.assertLess(refresh_delay_seconds(900), 900)
+        self.assertGreater(refresh_delay_seconds(960), refresh_delay_seconds(61))
+        self.assertEqual(refresh_delay_seconds(None), 30)
+        self.assertEqual(refresh_delay_seconds("junk"), 30)
+        self.assertEqual(refresh_delay_seconds(5), 10)
+
+    def test_raster_tile_source_keeps_signed_template_and_lifetime(self):
+        recorder = Recorder(
+            [
+                {
+                    "kind": "raster",
+                    "tile_url": "/raster-tiles/d/tiles/{z}/{x}/{y}.png?sig=s&exp=9&pv=0",
+                    "expires_in": 61,
+                }
+            ]
+        )
+        source = GeoLensClient("https://example.com", opener=recorder).tile_source("d")
+        self.assertEqual(
+            source["url"],
+            "https://example.com/raster-tiles/d/tiles/{z}/{x}/{y}.png?sig=s&exp=9&pv=0",
+        )
+        self.assertEqual(source["expires_in"], 61)
 
     def test_follows_next_links_but_rebases_origin(self):
         recorder = Recorder(

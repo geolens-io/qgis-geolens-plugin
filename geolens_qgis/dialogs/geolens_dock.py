@@ -39,7 +39,7 @@ from qgis.core import (
     QgsVectorTileLayer,
 )
 
-from ..client import Dataset, GeoLensClient, GeoLensError
+from ..client import Dataset, GeoLensClient, GeoLensError, refresh_delay_seconds
 
 ROLE_DATASET = Qt.ItemDataRole.UserRole
 # QgsJsonExporter writes six decimal places by default (RFC 7946).
@@ -260,8 +260,8 @@ class GeoLensDock(QDockWidget):
 
     def _uri(self, source):
         # Never put an API key in a layer URI: QGIS persists layer sources in
-        # project files. Private datasets should be connected through a
-        # user-managed QGIS Authentication configuration.
+        # project files. The URL carries a short-lived signed tile token
+        # instead, which _schedule_refresh keeps renewed.
         uri = QgsDataSourceUri()
         uri.setParam("type", "xyz")
         uri.setParam("url", source["url"])
@@ -284,6 +284,7 @@ class GeoLensDock(QDockWidget):
             raise GeoLensError("QGIS could not create the GeoLens raster tile layer")
         self._tag_layer(layer, dataset)
         QgsProject.instance().addMapLayer(layer)
+        self._schedule_refresh(layer, dataset, source, "wms")
         self._zoom_to(dataset)
         self._message(f"Added raster tiles: {dataset.title}")
 
@@ -294,31 +295,43 @@ class GeoLensDock(QDockWidget):
         self._tag_layer(layer, dataset)
         layer.setCustomProperty("geolens/source_layer", source.get("source_layer", ""))
         QgsProject.instance().addMapLayer(layer)
-        self._schedule_refresh(layer, dataset, source)
+        self._schedule_refresh(layer, dataset, source, "vectortile")
         self._zoom_to(dataset)
         self._message(f"Added vector tiles: {dataset.title}")
 
-    def _schedule_refresh(self, layer, dataset, source):
-        seconds = max(10, int(source.get("expires_in") or 60) - 30)
+    def _schedule_refresh(self, layer, dataset, source, provider, client=None):
+        # The dock can reconnect to another server while this layer is open;
+        # renewals must keep asking the server that issued the layer.
+        client = client or self.client
+        seconds = refresh_delay_seconds(source.get("expires_in"))
+        layer_id = layer.id()
         timer = QTimer(self)
         timer.setSingleShot(True)
 
         def refresh():
-            if not QgsProject.instance().mapLayer(layer.id()) or not self.client:
+            # Removing a layer deletes the object behind `layer`, so look it
+            # up again instead of touching the stale wrapper.
+            live = QgsProject.instance().mapLayer(layer_id)
+            if not live:
+                self._drop_refresh_timer(layer_id)
                 return
             try:
-                renewed = self.client.tile_source(dataset.id)
-                layer.setDataSource(self._uri(renewed), layer.name(), "vectortile")
-                self._schedule_refresh(layer, dataset, renewed)
+                renewed = client.tile_source(dataset.id)
+                live.setDataSource(self._uri(renewed), live.name(), provider)
+                self._schedule_refresh(live, dataset, renewed, provider, client)
             except GeoLensError:
                 timer.start(60_000)
 
         timer.timeout.connect(refresh)
         timer.start(seconds * 1000)
-        old = self.refresh_timers.pop(layer.id(), None)
-        if old:
-            old.stop()
-        self.refresh_timers[layer.id()] = timer
+        self._drop_refresh_timer(layer_id)
+        self.refresh_timers[layer_id] = timer
+
+    def _drop_refresh_timer(self, layer_id):
+        timer = self.refresh_timers.pop(layer_id, None)
+        if timer:
+            timer.stop()
+            timer.deleteLater()
 
     def _current_bbox(self):
         extent = self.iface.mapCanvas().extent()
