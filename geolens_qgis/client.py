@@ -28,10 +28,9 @@ def _plugin_version() -> str:
     return "unknown"
 
 
-# Sent on every request. Without it, urllib announces itself as
-# "Python-urllib/x.y", which common WAF/bot-mitigation rules block outright
-# with 403 before the request reaches GeoLens; a named agent also lets server
-# operators recognize plugin traffic in their logs.
+# Without it, the plain urllib opener announces itself as "Python-urllib/x.y",
+# which common WAF/bot-mitigation rules block outright with 403 before the
+# request reaches GeoLens. QGIS networking replaces it with QGIS's own agent.
 USER_AGENT = f"qgis-geolens-plugin/{_plugin_version()}"
 
 
@@ -139,12 +138,34 @@ class GeoLensClient:
             raise GeoLensError("GeoLens search returned no features")
         return [dataset for feature in features if (dataset := parse_dataset(feature))]
 
-    def capabilities(self) -> dict[str, bool]:
+    def capabilities(self) -> dict[str, Any]:
+        """What the server supports, with the feature flags as a fallback.
+
+        `document` is the full `/capabilities` response, or empty on servers
+        that predate it; `publish_contract` is None there.
+        """
         try:
-            body = self._request("/api/settings/feature-flags/")
-        except GeoLensError:
-            return {"dataset_editing": False}
-        return {"dataset_editing": body.get("enable_dataset_editing") is True}
+            body = self._request("/api/capabilities")
+        except (GeoLensError, ValueError):
+            body = None
+        if isinstance(body, dict):
+            flags = body.get("flags")
+            editing = isinstance(flags, dict) and flags.get("enable_dataset_editing")
+            return {
+                "dataset_editing": editing is True,
+                "publish_contract": body.get("publish_contract"),
+                "document": body,
+            }
+        try:
+            flags = self._request("/api/settings/feature-flags/")
+        except (GeoLensError, ValueError):
+            flags = None
+        editing = isinstance(flags, dict) and flags.get("enable_dataset_editing")
+        return {
+            "dataset_editing": editing is True,
+            "publish_contract": None,
+            "document": {},
+        }
 
     def tile_source(self, dataset_id: str) -> dict[str, Any]:
         body = self._request(f"/api/tiles/token/{quote(dataset_id, safe='')}/")

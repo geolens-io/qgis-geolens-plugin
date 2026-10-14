@@ -38,8 +38,17 @@ from qgis.core import (
     QgsVectorLayer,
     QgsVectorTileLayer,
 )
+from qgis.gui import QgsAuthConfigSelect
 
-from ..client import Dataset, GeoLensClient, GeoLensError, refresh_delay_seconds
+from ..client import Dataset, GeoLensError, refresh_delay_seconds
+from ..connection import (
+    AUTHCFG_SETTING,
+    LEGACY_KEY_SETTING,
+    SERVER_SETTING,
+    GeoLensConnection,
+    migrate_plaintext_key,
+    store_api_key,
+)
 
 ROLE_DATASET = Qt.ItemDataRole.UserRole
 # QgsJsonExporter writes six decimal places by default (RFC 7946).
@@ -48,14 +57,16 @@ SAMPLE_SERVERS = (("GeoLibre datasets", "https://datasets.geolibre.app"),)
 
 
 class GeoLensDock(QDockWidget):
-    def __init__(self, iface):
+    def __init__(self, iface, opener=None):
         super().__init__("GeoLens", iface.mainWindow())
         self.setObjectName("GeoLensDock")
         self.setAllowedAreas(
             Qt.DockWidgetArea.LeftDockWidgetArea | Qt.DockWidgetArea.RightDockWidgetArea
         )
         self.iface = iface
-        self.client: GeoLensClient | None = None
+        self._opener = opener
+        self.connection: GeoLensConnection | None = None
+        self.client = None
         self.datasets: dict[str, Dataset] = {}
         self.baselines: dict[str, dict[int, dict]] = {}
         self.temp_files: list[str] = []
@@ -82,17 +93,21 @@ class GeoLensDock(QDockWidget):
         form = QFormLayout()
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://datasets.geolibre.app")
+        self.auth_select = QgsAuthConfigSelect(self)
         self.key_edit = QLineEdit()
-        self.key_edit.setPlaceholderText("Optional; kept in memory for this session")
+        self.key_edit.setPlaceholderText(
+            "Optional; used instead of the authentication above"
+        )
         self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
-        self.remember_key = QCheckBox("Remember API key in this QGIS profile")
-        self.remember_key.setToolTip(
-            "QGIS profile settings are stored as plain text. Leave this off "
-            "unless the profile directory is trusted."
+        self.save_key = QCheckBox("Save API key in the QGIS authentication database")
+        self.save_key.setToolTip(
+            "The key is encrypted with the QGIS master password. Unchecked, "
+            "it is kept in memory for this session only."
         )
         form.addRow("Server", self.url_edit)
+        form.addRow("Authentication", self.auth_select)
         form.addRow("API key", self.key_edit)
-        form.addRow(self.remember_key)
+        form.addRow(self.save_key)
         layout.addLayout(form)
 
         self.connect_button = QPushButton("Connect")
@@ -154,16 +169,18 @@ class GeoLensDock(QDockWidget):
 
     def _restore_settings(self):
         settings = QSettings()
-        self.url_edit.setText(settings.value("geolens/server", "", str))
-        stored_key = settings.value("geolens/api_key", "", str)
-        self.key_edit.setText(stored_key)
-        self.remember_key.setChecked(bool(stored_key))
+        self.url_edit.setText(settings.value(SERVER_SETTING, "", str))
+        migrate_plaintext_key(settings, self._message)
+        self.auth_select.setConfigId(settings.value(AUTHCFG_SETTING, "", str))
+        # A key that could not be moved yet still works for this session.
+        self.key_edit.setText(settings.value(LEGACY_KEY_SETTING, "", str))
         self.limit.setValue(settings.value("geolens/feature_limit", 10000, int))
 
     def _choose_sample(self, index):
         url = self.samples.itemData(index)
         if url:
             self.url_edit.setText(url)
+            self.auth_select.setConfigId("")
             self.key_edit.clear()
 
     def _selected_dataset(self) -> Dataset | None:
@@ -194,22 +211,26 @@ class GeoLensDock(QDockWidget):
         self.iface.messageBar().pushMessage("GeoLens", text, level=level, duration=6)
 
     def connect_server(self):
+        key = self.key_edit.text().strip()
         try:
-            client = GeoLensClient(self.url_edit.text(), self.key_edit.text())
-            datasets = client.search(limit=50)
-            capabilities = client.capabilities()
+            connection = GeoLensConnection(
+                self.url_edit.text(),
+                authcfg=self.auth_select.configId(),
+                api_key=key,
+                opener=self._opener,
+            )
+            datasets = connection.connect()
         except (ValueError, GeoLensError) as error:
             self._message(str(error), Qgis.MessageLevel.Critical)
             return
-        self.client = client
-        self.editing_enabled = capabilities["dataset_editing"]
+        self.connection = connection
+        self.client = connection.client
+        self.editing_enabled = connection.capabilities["dataset_editing"]
+        if key and self.save_key.isChecked():
+            self._save_key(key, connection.base_url)
         settings = QSettings()
-        settings.setValue("geolens/server", client.base_url)
-        # QSettings is plain text, so the key is only written on explicit opt-in.
-        if self.remember_key.isChecked():
-            settings.setValue("geolens/api_key", client.api_key)
-        else:
-            settings.remove("geolens/api_key")
+        settings.setValue(SERVER_SETTING, connection.base_url)
+        settings.setValue(AUTHCFG_SETTING, self.auth_select.configId())
         self._show_datasets(datasets)
         suffix = (
             " Editing is enabled."
@@ -217,6 +238,27 @@ class GeoLensDock(QDockWidget):
             else " Editing is disabled by this server."
         )
         self._message(f"Connected — {len(datasets)} datasets.{suffix}")
+
+    def _save_key(self, key, server_url):
+        authcfg = store_api_key(
+            key,
+            server_url,
+            self._message,
+            "Saving the API key in the QGIS authentication database.",
+        )
+        if not authcfg:
+            self._message(
+                "The API key could not be saved in the QGIS authentication "
+                "database. It is kept in memory for this session only.",
+                Qgis.MessageLevel.Warning,
+            )
+            return
+        settings = QSettings()
+        if settings.value(LEGACY_KEY_SETTING, "", str).strip() == key:
+            settings.remove(LEGACY_KEY_SETTING)
+        self.auth_select.setConfigId(authcfg)
+        self.key_edit.clear()
+        self.save_key.setChecked(False)
 
     def search(self):
         if not self.client:

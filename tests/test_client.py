@@ -1,6 +1,7 @@
 import json
 import unittest
 from io import BytesIO
+from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
 
 from geolens_qgis.client import (
@@ -35,6 +36,21 @@ class Recorder:
         return Response(next(self.responses))
 
 
+class Routes:
+    """An opener answering by path; a missing path is a 404."""
+
+    def __init__(self, bodies):
+        self.bodies = bodies
+        self.paths = []
+
+    def __call__(self, request, timeout=0):
+        path = urlparse(request.full_url).path
+        self.paths.append(path)
+        if path not in self.bodies:
+            raise HTTPError(request.full_url, 404, "Not Found", {}, BytesIO(b"{}"))
+        return Response(self.bodies[path])
+
+
 class ClientTests(unittest.TestCase):
     def test_sends_identifying_user_agent(self):
         recorder = Recorder([{"features": []}])
@@ -52,6 +68,30 @@ class ClientTests(unittest.TestCase):
         request = recorder.requests[0]
         self.assertEqual(request.get_header("X-api-key"), "secret")
         self.assertEqual(urlparse(request.full_url).netloc, "example.com")
+
+    def test_capabilities_come_from_the_capabilities_endpoint(self):
+        document = {"publish_contract": 2, "flags": {"enable_dataset_editing": True}}
+        routes = Routes({"/api/capabilities": document})
+        capabilities = GeoLensClient("example.com", opener=routes).capabilities()
+        self.assertTrue(capabilities["dataset_editing"])
+        self.assertEqual(capabilities["publish_contract"], 2)
+        self.assertEqual(capabilities["document"], document)
+        self.assertEqual(routes.paths, ["/api/capabilities"])
+
+    def test_capabilities_fall_back_to_feature_flags_on_older_servers(self):
+        routes = Routes(
+            {"/api/settings/feature-flags/": {"enable_dataset_editing": True}}
+        )
+        capabilities = GeoLensClient("example.com", opener=routes).capabilities()
+        self.assertTrue(capabilities["dataset_editing"])
+        self.assertIsNone(capabilities["publish_contract"])
+        self.assertEqual(
+            routes.paths, ["/api/capabilities", "/api/settings/feature-flags/"]
+        )
+
+    def test_capabilities_without_either_endpoint_disable_editing(self):
+        capabilities = GeoLensClient("example.com", opener=Routes({})).capabilities()
+        self.assertFalse(capabilities["dataset_editing"])
 
     def test_parses_vector_and_raster_datasets(self):
         vector = parse_dataset(

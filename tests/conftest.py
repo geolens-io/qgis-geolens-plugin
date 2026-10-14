@@ -17,7 +17,7 @@ except ImportError:
     HAS_REAL_QGIS = False
 
 try:
-    from PyQt6 import QtCore, QtGui, QtWidgets
+    from PyQt6 import QtCore, QtGui, QtNetwork, QtWidgets
 
     HAS_PYQT6 = True
 except ImportError:  # Qt-independent tests still run without PyQt6 installed.
@@ -51,6 +51,7 @@ def _install_qgis_stub():
     for name, module in (
         ("QtCore", QtCore),
         ("QtGui", QtGui),
+        ("QtNetwork", QtNetwork),
         ("QtWidgets", QtWidgets),
     ):
         alias = types.ModuleType(f"qgis.PyQt.{name}")
@@ -65,9 +66,13 @@ def _install_qgis_stub():
     core = types.ModuleType("qgis.core")
     core.Qgis = _Qgis
     for name in (
+        "QgsApplication",
+        "QgsAuthMethodConfig",
+        "QgsBlockingNetworkRequest",
         "QgsCoordinateReferenceSystem",
         "QgsCoordinateTransform",
         "QgsDataSourceUri",
+        "QgsFeedback",
         "QgsJsonExporter",
         "QgsProject",
         "QgsRasterLayer",
@@ -78,6 +83,11 @@ def _install_qgis_stub():
         setattr(core, name, _Placeholder)
     sys.modules["qgis.core"] = core
     qgis.core = core
+
+    gui = types.ModuleType("qgis.gui")
+    gui.QgsAuthConfigSelect = _Placeholder
+    sys.modules["qgis.gui"] = gui
+    qgis.gui = gui
 
 
 if HAS_PYQT6 and not HAS_REAL_QGIS:

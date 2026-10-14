@@ -6,7 +6,7 @@ This is a community project and is not affiliated with, or endorsed by, any GeoL
 
 ## Features
 
-- Connect to any GeoLens server, with an optional API key for private data.
+- Connect to any GeoLens server. Private data uses an API key kept in the QGIS authentication database, or pasted for one session.
 - Search the catalog and inspect dataset descriptions, types, and feature counts.
 - Add vector datasets as signed Mapbox Vector Tile layers with automatic token renewal.
 - Add public raster datasets as server-rendered XYZ tile layers.
@@ -36,14 +36,23 @@ python install.py --plugin-dir /path/to/profile/python/plugins
 ## Usage
 
 1. Enter a GeoLens server URL or choose a sample server.
-2. Enter an API key if the catalog or datasets are private, then click **Connect**.
+2. If the catalog or datasets are private, choose an authentication configuration or paste an API key, then click **Connect**. Tick **Save API key in the QGIS authentication database** to keep a pasted key.
 3. Search and select a dataset.
 4. Choose **Add tiles** for scalable viewing, or **Add features** for attributes and editing.
 5. For an editable feature layer, commit QGIS edits, select that layer, and click **Sync selected GeoLens layer edits**.
 
 ![](https://github.com/user-attachments/assets/3842764d-6e33-4b2b-8cb5-d56d7db2bfca)
 
-GeoLens writes are per-feature and are not transactional. The plugin reports partial failures and requires confirmation before deleting server features. API keys are stored only in the local QGIS profile settings and are never written to project layer properties.
+GeoLens writes are per-feature and are not transactional. The plugin reports partial failures and requires confirmation before deleting server features.
+
+A saved API key is an API Header configuration (`X-Api-Key`) in the QGIS
+authentication database, encrypted with the QGIS master password. Earlier
+versions could keep the key in plain text in the profile settings; opening the
+GeoLens panel moves such a key into the authentication database and deletes
+the plain-text copy. If that move fails or you cancel the master password
+prompt, the key stays where it was and the panel tries again in your next QGIS
+session. No key
+is written to a layer source or a project file.
 
 Private vector and raster tiles load with a short-lived signed token that the
 plugin renews while the layer is open. No API key is written into a layer
@@ -70,6 +79,7 @@ geolens_qgis/
 ├── dialogs/geolens_dock.py  # Catalog, layer, and edit-sync panel
 ├── icons/                   # Toolbar and About SVG assets
 ├── client.py                # Dependency-free GeoLens API client
+├── connection.py            # Server, QGIS auth config and network transport
 ├── plugin.py                # QGIS lifecycle, menu, and toolbar integration
 ├── metadata.txt
 └── LICENSE
