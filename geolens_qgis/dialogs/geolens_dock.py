@@ -221,6 +221,7 @@ class GeoLensDock(QDockWidget):
             )
             datasets = connection.connect()
         except (ValueError, GeoLensError) as error:
+            self._disconnect()
             self._message(str(error), Qgis.MessageLevel.Critical)
             return
         self.connection = connection
@@ -238,6 +239,13 @@ class GeoLensDock(QDockWidget):
             else " Editing is disabled by this server."
         )
         self._message(f"Connected — {len(datasets)} datasets.{suffix}")
+
+    def _disconnect(self):
+        """Forget the current connection and the catalog it returned."""
+        self.connection = None
+        self.client = None
+        self.editing_enabled = False
+        self._show_datasets([])
 
     def _save_key(self, key, server_url):
         authcfg = store_api_key(

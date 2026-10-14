@@ -457,3 +457,70 @@ def test_a_cancelled_migration_keeps_the_key_through_the_session(
     finally:
         dock.cleanup()
         assert auth_manager.setMasterPassword(MASTER, True)
+
+
+def _raise_http_error(request, timeout=0):
+    raise HTTPError(request.full_url, 401, "Unauthorized", {}, BytesIO(b"{}"))
+
+
+def _raise_network_error(request, timeout=0):
+    raise OSError("connection refused")
+
+
+def _not_geolens(request, timeout=0):
+    return BytesIO(b'{"hello": "world"}')
+
+
+@pytest.mark.parametrize(
+    "url, opener, unusable_auth, shown",
+    [
+        ("https://gis.example.org", _raise_http_error, False, "401"),
+        ("https://gis.example.org", _raise_network_error, False, "connection refused"),
+        ("https://gis.example.org", _not_geolens, False, "GeoLens"),
+        ("", None, False, "HTTP(S) server URL"),
+        # Local server, real QGIS transport: the config sends no X-Api-Key.
+        (None, None, True, "X-Api-Key"),
+    ],
+    ids=["http-error", "network-error", "not-geolens", "bad-url", "unusable-auth"],
+)
+def test_a_failed_connect_clears_the_previous_catalog(
+    qgis_iface,
+    auth_manager,
+    clean_profile_settings,
+    server,
+    url,
+    opener,
+    unusable_auth,
+    shown,
+):
+    from geolens_qgis.dialogs import GeoLensDock
+
+    authcfg = ""
+    if unusable_auth:
+        config = QgsAuthMethodConfig("APIHeader")
+        config.setName("not GeoLens")
+        config.setConfig("X-Other", "value")
+        stored, config = auth_manager.storeAuthenticationConfig(config)
+        assert stored
+        authcfg = config.id()
+    dock = GeoLensDock(qgis_iface, opener=_FakeGeoLens())
+    try:
+        dock.url_edit.setText("https://gis.example.org")
+        dock.connect_server()
+        _select(dock, "Roads")
+        assert dock.tiles_button.isEnabled() and dock.editing_enabled
+        dock._opener = opener
+        dock.url_edit.setText(server.url if url is None else url)
+        dock.auth_select.setConfigId(authcfg)
+        dock.connect_server()
+        assert shown in dock.status.text()
+        assert server.seen == []
+        assert dock.results.topLevelItemCount() == 0
+        assert dock.datasets == {}
+        assert dock.client is None and dock.connection is None
+        assert not dock.editing_enabled
+        assert not dock.tiles_button.isEnabled()
+        assert not dock.features_button.isEnabled()
+        assert not dock.metadata_button.isEnabled()
+    finally:
+        dock.cleanup()
