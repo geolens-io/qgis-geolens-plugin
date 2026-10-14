@@ -49,3 +49,30 @@ jobs:
       - run: pip install PyQt6 pytest
       - run: pytest tests -v
       - run: python package_plugin.py --output dist/geolens_qgis.zip
+
+  qgis:
+    name: QGIS ${{ matrix.qgis }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Each image is pinned by digest so a run is reproducible and a bump is a
+    # reviewed change. `docker buildx imagetools inspect qgis/qgis:<tag>`
+    # prints the index digest. When QGIS names its next long-term release,
+    # move the LTR row.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - qgis: "4.2"
+            image: qgis/qgis:4.2.2@sha256:6ffe6b31646247f2e179cb2cc32bb4df215eedc99f387ad59a6cc88ebfe23e21
+          - qgis: "3.44 LTR"
+            image: qgis/qgis:3.44.14@sha256:681853565ad03722a0cbcba23985fd211ca927bec2b3d389cb07e0e0412e4184
+    container:
+      image: ${{ matrix.image }}
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - run: python3 -m pip install --break-system-packages pytest-qgis==5.0.1
+      - run: python3 -m pytest tests -v

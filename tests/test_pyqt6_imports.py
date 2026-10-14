@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-pytest.importorskip("PyQt6.QtWidgets")
+pytest.importorskip("PyQt6.QtWidgets", exc_type=ImportError)
 
 PLUGIN_ROOT = Path(__file__).resolve().parents[1] / "geolens_qgis"
 

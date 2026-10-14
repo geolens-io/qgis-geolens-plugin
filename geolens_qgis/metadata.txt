@@ -1,6 +1,6 @@
 [general]
 name=GeoLens
-qgisMinimumVersion=3.28
+qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 description=Browse, visualize, and edit datasets hosted by a GeoLens server.
 about=Connect to public or private GeoLens catalogs. Search datasets, open metadata, add signed vector tiles, add raster XYZ tiles, or load OGC API Features as editable QGIS layers. Edited feature layers can be synchronized back to GeoLens when server-side editing is enabled.

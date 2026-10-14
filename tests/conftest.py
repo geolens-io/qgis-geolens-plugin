@@ -1,11 +1,20 @@
-"""Strict-enough QGIS stubs for PyQt6 import smoke tests."""
+"""QGIS test setup: a PyQt6 stub unless a real QGIS is importable."""
 
 import pathlib
 import sys
 import types
 
+import pytest
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
+
+try:
+    import qgis.core  # noqa: F401
+
+    HAS_REAL_QGIS = True
+except ImportError:
+    HAS_REAL_QGIS = False
 
 try:
     from PyQt6 import QtCore, QtGui, QtWidgets
@@ -71,5 +80,12 @@ def _install_qgis_stub():
     qgis.core = core
 
 
-if HAS_PYQT6:
+if HAS_PYQT6 and not HAS_REAL_QGIS:
     _install_qgis_stub()
+
+
+@pytest.fixture
+def real_qgis():
+    """Skip tests that need the QGIS libraries when only the stub is present."""
+    if not HAS_REAL_QGIS:
+        pytest.skip("requires a real QGIS")

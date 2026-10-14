@@ -6,3 +6,4 @@ dist/
 *.zip
 .idea/
 .vscode/
+.qgis-settings/
