@@ -40,7 +40,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsAuthConfigSelect
 
-from ..client import Dataset, GeoLensError, refresh_delay_seconds
+from ..client import Dataset, GeoLensError, refresh_delay_seconds, same_server
 from ..connection import (
     AUTHCFG_SETTING,
     LEGACY_KEY_SETTING,
@@ -482,6 +482,21 @@ class GeoLensDock(QDockWidget):
                 "The selected layer has no GeoLens edit baseline in this session. "
                 "Reload it with Add features; datasets without integer feature "
                 "IDs cannot be synchronized.",
+                Qgis.MessageLevel.Warning,
+            )
+            return
+        origin = str(layer.customProperty("geolens/server", "") or "")
+        if not same_server(origin, self.client.base_url):
+            # The dataset id and the baseline belong to the server that
+            # issued the layer, so its edits go to no other server.
+            self._message(
+                (
+                    f"This layer came from {origin}. Connect to that server to "
+                    "synchronize its edits."
+                    if origin
+                    else "This layer doesn't record which GeoLens server it came "
+                    "from, so its edits can't be synchronized."
+                ),
                 Qgis.MessageLevel.Warning,
             )
             return

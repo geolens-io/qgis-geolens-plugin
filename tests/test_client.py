@@ -9,6 +9,7 @@ from geolens_qgis.client import (
     parse_dataset,
     parse_tile_scope,
     refresh_delay_seconds,
+    same_server,
 )
 
 
@@ -155,6 +156,31 @@ class ClientTests(unittest.TestCase):
                 self.assertEqual(source["source_layer"], f"data.{table}")
                 self.assertEqual(query["scope"], [scope])
                 self.assertEqual(query.get("pv"), ["3"] if ":p3" in scope else None)
+
+    def test_same_server_ignores_case_default_port_and_trailing_slash(self):
+        for other in (
+            "https://gis.example.org",
+            "HTTPS://GIS.Example.org/",
+            "https://gis.example.org:443",
+        ):
+            with self.subTest(other=other):
+                self.assertTrue(same_server("https://gis.example.org", other))
+        self.assertTrue(
+            same_server("http://gis.example.org:80/geo/", "http://gis.example.org/geo")
+        )
+
+    def test_same_server_tells_servers_apart(self):
+        for other in (
+            "https://other.example.org",
+            "http://gis.example.org",
+            "https://gis.example.org:8443",
+            "https://gis.example.org/other",
+            "",
+            "gis.example.org",
+        ):
+            with self.subTest(other=other):
+                self.assertFalse(same_server("https://gis.example.org", other))
+        self.assertFalse(same_server("", ""))
 
     def test_parses_tile_scopes(self):
         self.assertEqual(parse_tile_scope("roads:p3"), ("roads", "3"))

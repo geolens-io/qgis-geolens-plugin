@@ -524,3 +524,111 @@ def test_a_failed_connect_clears_the_previous_catalog(
         assert not dock.metadata_button.isEnabled()
     finally:
         dock.cleanup()
+
+
+class _RecordingGeoLens(_FakeGeoLens):
+    """The fake server, plus a log of every write it receives."""
+
+    def __init__(self):
+        self.writes = []
+
+    def __call__(self, request, timeout=0):
+        if request.get_method() != "GET":
+            self.writes.append((request.get_method(), request.full_url))
+            return BytesIO(b"{}")
+        return super().__call__(request, timeout)
+
+
+def _load_edited_roads(dock, qgis_iface, server):
+    """Load roads from `server`, then change one attribute without committing."""
+    dock.url_edit.setText(server)
+    dock.connect_server()
+    dock.view_only.setChecked(False)
+    _select(dock, "Roads")
+    dock.add_features()
+    from qgis.core import QgsProject
+
+    (layer,) = QgsProject.instance().mapLayersByName("Roads")
+    qgis_iface.setActiveLayer(layer)
+    layer.startEditing()
+    feature = next(layer.getFeatures())
+    layer.changeAttributeValue(feature.id(), layer.fields().indexOf("name"), "B")
+    return layer
+
+
+@pytest.mark.parametrize("recorded", ["https://other.example.org", ""])
+def test_sync_refuses_a_layer_from_another_server(
+    qgis_iface, clean_profile_settings, recorded
+):
+    from qgis.core import QgsProject
+
+    from geolens_qgis.dialogs import GeoLensDock
+
+    opener = _RecordingGeoLens()
+    dock = GeoLensDock(qgis_iface, opener=opener)
+    messages = _recording_messages(dock)
+    try:
+        layer = _load_edited_roads(dock, qgis_iface, "https://gis.example.org")
+        layer.setCustomProperty("geolens/server", recorded)
+        baseline = json.dumps(dock.baselines[layer.id()], sort_keys=True)
+        dock.sync_active_layer()
+        assert opener.writes == []
+        if recorded:
+            assert f"came from {recorded}" in messages[-1]
+        else:
+            assert "doesn't record" in messages[-1]
+        # The edit is still pending in the layer and the baseline is unchanged.
+        assert layer.isEditable() and layer.isModified()
+        assert json.dumps(dock.baselines[layer.id()], sort_keys=True) == baseline
+    finally:
+        dock.cleanup()
+        QgsProject.instance().clear()
+
+
+def test_a_reopened_layer_from_another_server_is_told_to_reload_it(
+    qgis_iface, clean_profile_settings
+):
+    from qgis.core import QgsProject
+
+    from geolens_qgis.dialogs import GeoLensDock
+
+    opener = _RecordingGeoLens()
+    dock = GeoLensDock(qgis_iface, opener=opener)
+    messages = _recording_messages(dock)
+    try:
+        layer = _load_edited_roads(dock, qgis_iface, "https://gis.example.org")
+        layer.setCustomProperty("geolens/server", "https://other.example.org")
+        del dock.baselines[layer.id()]
+        dock.sync_active_layer()
+        assert "no GeoLens edit baseline" in messages[-1]
+        assert opener.writes == []
+        assert layer.isEditable() and layer.isModified()
+    finally:
+        dock.cleanup()
+        QgsProject.instance().clear()
+
+
+def test_sync_after_reconnecting_to_the_same_server_sends_the_edit(
+    qgis_iface, clean_profile_settings
+):
+    from qgis.core import QgsProject
+
+    from geolens_qgis.dialogs import GeoLensDock
+
+    opener = _RecordingGeoLens()
+    dock = GeoLensDock(qgis_iface, opener=opener)
+    try:
+        _load_edited_roads(dock, qgis_iface, "https://gis.example.org")
+        dock.url_edit.setText("https://other.example.org")
+        dock.connect_server()
+        dock.sync_active_layer()
+        assert opener.writes == []
+        dock.url_edit.setText("HTTPS://GIS.example.org:443/")
+        dock.connect_server()
+        dock.sync_active_layer()
+        assert [(method, urlparse(url).path) for method, url in opener.writes] == [
+            ("PUT", "/api/datasets/roads/features/1")
+        ]
+    finally:
+        dock.cleanup()
+        QgsProject.instance().clear()

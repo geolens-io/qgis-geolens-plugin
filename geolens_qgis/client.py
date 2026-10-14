@@ -60,6 +60,33 @@ def refresh_delay_seconds(expires_in: Any) -> int:
     return max(10, lifetime - 30)
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def _server_key(url: str) -> tuple[str, str, int | None, str] | None:
+    parsed = urlparse(url.strip())
+    try:
+        port = parsed.port
+    except ValueError:
+        return None
+    scheme = parsed.scheme.lower()
+    if not parsed.hostname or scheme not in _DEFAULT_PORTS:
+        return None
+    if port == _DEFAULT_PORTS[scheme]:
+        port = None
+    return scheme, parsed.hostname.lower(), port, parsed.path.rstrip("/")
+
+
+def same_server(first: str, second: str) -> bool:
+    """Whether two GeoLens server URLs name the same server.
+
+    Scheme and host case, a default port and a trailing slash don't matter.
+    A URL without an HTTP(S) scheme and host never matches.
+    """
+    key = _server_key(first)
+    return key is not None and key == _server_key(second)
+
+
 @dataclass(frozen=True)
 class Dataset:
     id: str
