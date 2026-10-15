@@ -185,10 +185,14 @@ class GeoLensClient:
         except OSError as error:
             raise GeoLensError(f"Could not reach GeoLens: {error}") from error
 
-    def search(self, query: str = "", limit: int = 50) -> list[Dataset]:
+    def search(
+        self, query: str = "", limit: int = 50, sort_by: str = ""
+    ) -> list[Dataset]:
         params = {"limit": max(1, int(limit))}
         if query.strip():
             params["q"] = query.strip()
+        if sort_by:
+            params["sort_by"] = sort_by
         body = self._request("/api/search/datasets/?" + urlencode(params))
         features = body.get("features") if isinstance(body, dict) else None
         if not isinstance(features, list):

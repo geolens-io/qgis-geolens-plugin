@@ -5,11 +5,12 @@ from __future__ import annotations
 import configparser
 import os
 
-from qgis.core import QgsSettings
+from qgis.core import QgsApplication, QgsSettings
 from qgis.PyQt.QtCore import QCoreApplication, QLocale, Qt, QTranslator
 from qgis.PyQt.QtGui import QGuiApplication, QIcon
 from qgis.PyQt.QtWidgets import QAction, QMessageBox
 
+from .browser import GeoLensDataItemProvider, GeoLensDropHandler
 from .i18n import tr
 
 DOCS_URL = "https://docs.getgeolens.com/guides/api/qgis/"
@@ -48,6 +49,8 @@ class GeoLensPlugin:
         self.toolbar = None
         self.dock = None
         self.translator = None
+        self.browser_provider = None
+        self.drop_handler = None
 
     def _install_translator(self):
         path = os.path.join(self.plugin_dir, "i18n", f"geolens_{user_language()}.qm")
@@ -85,6 +88,12 @@ class GeoLensPlugin:
             self.show_about,
             tr("About the GeoLens QGIS plugin"),
         )
+        self.browser_provider = GeoLensDataItemProvider(
+            self._ensure_dock, self._icon("icon")
+        )
+        QgsApplication.dataItemProviderRegistry().addProvider(self.browser_provider)
+        self.drop_handler = GeoLensDropHandler(self._ensure_dock)
+        self.iface.registerCustomDropHandler(self.drop_handler)
 
     def _add_action(self, icon_name, text, callback, status_tip, toolbar=False):
         action = QAction(self._icon(icon_name), text, self.iface.mainWindow())
@@ -98,6 +107,15 @@ class GeoLensPlugin:
         return action
 
     def unload(self):
+        if self.browser_provider:
+            # The registry owns and deletes the provider.
+            QgsApplication.dataItemProviderRegistry().removeProvider(
+                self.browser_provider
+            )
+            self.browser_provider = None
+        if self.drop_handler:
+            self.iface.unregisterCustomDropHandler(self.drop_handler)
+            self.drop_handler = None
         for action in self.actions:
             self.iface.removePluginWebMenu("GeoLens", action)
             self.iface.removeToolBarIcon(action)
@@ -125,6 +143,16 @@ class GeoLensPlugin:
             return
         self.dock.show()
         self.dock.raise_()
+
+    def _ensure_dock(self):
+        """The dock, created hidden on first use from the Browser panel."""
+        if self.dock is None:
+            from .dialogs import GeoLensDock
+
+            self.dock = GeoLensDock(self.iface)
+            self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
+            self.dock.hide()
+        return self.dock
 
     def about_box(self):
         box = QMessageBox(self.iface.mainWindow())

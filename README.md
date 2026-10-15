@@ -12,6 +12,7 @@ This is a community project and is not affiliated with, or endorsed by, any GeoL
 - Add public raster datasets as server-rendered XYZ tile layers.
 - Load vector datasets through OGC API Features, optionally clipped to the current map extent.
 - Open a dataset's GeoLens metadata page.
+- Find datasets in the QGIS Browser panel under GeoLens, listed by saved connection. Double-click or drag one onto the map to add its tiles, or right-click to add editable features or open its metadata page.
 - Edit loaded feature layers in QGIS and synchronize creates, updates, and deletes back to GeoLens when the server permits editing.
 - Use the public GeoLibre datasets server from the built-in server picker.
 
