@@ -9,6 +9,7 @@ import json
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 
 from qgis.PyQt.QtCore import (
     QCoreApplication,
@@ -115,6 +116,27 @@ LOG_TAG = "GeoLens"
 _HTTP_ERROR = re.compile(r"GeoLens request failed \(HTTP (\d+)\)(?::.*)?", re.DOTALL)
 _UNREACHABLE = re.compile(r"Could not reach GeoLens:.*", re.DOTALL)
 _UNREADABLE = re.compile(r"GeoLens [a-z ]*(?:malformed|returned no|contained no)[^.]*")
+
+
+def _instant(text):
+    """`text` as an aware UTC-comparable datetime, or None when it isn't a date.
+
+    Python 3.10's `fromisoformat` rejects `Z` and fractions that aren't 3 or 6
+    digits, so those are normalized first. A date with no offset counts as UTC.
+    """
+    if not isinstance(text, str):
+        return None
+    text = text.strip()
+    if text[-1:] in ("Z", "z"):
+        text = text[:-1] + "+00:00"
+    text = re.sub(
+        r"\.(\d+)", lambda m: "." + m.group(1)[:6].ljust(6, "0"), text, count=1
+    )
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
 def _http_failure(code):
@@ -856,7 +878,7 @@ class GeoLensDock(QDockWidget):
         self._loaded = list(datasets)
         self._query = query.strip()
         self.datasets = {dataset.id: dataset for dataset in datasets}
-        dated = any(dataset.updated for dataset in datasets)
+        dated = any(_instant(dataset.updated) for dataset in datasets)
         newest = self.sort_combo.model().item(self.sort_combo.findData("newest"))
         newest.setEnabled(dated)
         if not dated and self.sort_combo.currentData() == "newest":
@@ -889,7 +911,10 @@ class GeoLensDock(QDockWidget):
         if order == "title":
             rows.sort(key=lambda dataset: dataset.title.casefold())
         elif order == "newest":
-            rows.sort(key=lambda dataset: dataset.updated or "", reverse=True)
+            dated = [d for d in rows if _instant(d.updated)]
+            undated = [d for d in rows if not _instant(d.updated)]
+            dated.sort(key=lambda d: _instant(d.updated), reverse=True)
+            rows = dated + undated
         self.results.clear()
         for dataset in rows:
             item = self._row(dataset)
@@ -977,7 +1002,7 @@ class GeoLensDock(QDockWidget):
                     )
                 return
             self._thumbnails[key] = data
-            self._show_thumbnail(key, dataset)
+            self._show_thumbnail(key)
 
         task = QgsTask.fromFunction(
             tr("Loading a dataset preview"), work, on_finished=finished
@@ -991,17 +1016,25 @@ class GeoLensDock(QDockWidget):
         dataset = item.data(0, ROLE_DATASET) if item else None
         return dataset.id if dataset else None
 
-    def _show_thumbnail(self, key, dataset):
-        """Show the finished preview if the pointer is still over its row."""
+    def _show_thumbnail(self, key):
+        """Show a finished preview if it still matches the row under the pointer.
+
+        The row may have been refreshed since the fetch began, so the text and
+        the version come from the current record, not the one captured then.
+        """
+        current = self.datasets.get(key[1])
         if (
             not self.client
             or key[0] != self.client.base_url
-            or self._hovered_dataset_id() != dataset.id
+            or current is None
+            or not current.has_quicklook
+            or current.quicklook_version != key[2]
+            or self._hovered_dataset_id() != current.id
         ):
             return
         QToolTip.showText(
             self._hover_pos,
-            self._tooltip(dataset, _kind(dataset)[1], self._thumbnails[key]),
+            self._tooltip(current, _kind(current)[1], self._thumbnails[key]),
             self.results.viewport(),
         )
 

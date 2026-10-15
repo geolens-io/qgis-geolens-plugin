@@ -81,6 +81,7 @@ class FakeServer:
         self.timeouts = {}
         self.quicklook_threads = []
         self.gate = None
+        self.version_gates = {}
         self.during_search = None
 
     def __call__(self, request, timeout=0):
@@ -103,6 +104,9 @@ class FakeServer:
             self.quicklook_threads.append(threading.get_ident())
             if self.gate is not None:
                 self.gate.wait(10)
+            gate = self.version_gates.get(parse_qs(url.query).get("v", [""])[0])
+            if gate is not None:
+                gate.wait(10)
             return BytesIO(_png())
         if path == "/api/tiles/token/dem/":
             body = {
@@ -606,3 +610,117 @@ def test_the_qgis_transport_gives_up_on_a_server_that_never_answers():
         with pytest.raises(OSError):
             QgisTransport()(Request(url), timeout=0.5)
         assert time.monotonic() - started < 10
+
+
+def _roads(**props):
+    base = dict(DATASETS[0]["properties"])
+    return [_feature("roads", base.pop("title"), **{**base, **props})]
+
+
+def _record_tooltips(monkeypatch, dock):
+    shown = []
+    monkeypatch.setattr(
+        geolens_dock.QToolTip,
+        "showText",
+        lambda pos, text, widget=None: shown.append(text),
+    )
+    monkeypatch.setattr(dock, "_hovered_dataset_id", lambda: "roads")
+    return shown
+
+
+def _wait_idle(dock):
+    for _ in range(100):
+        if not dock._pending:
+            return
+        QTest.qWait(50)
+
+
+@pytest.mark.parametrize("v1_first", [True, False], ids=["v1-first", "v2-first"])
+def test_a_preview_for_a_replaced_version_never_shows(make_dock, monkeypatch, v1_first):
+    server = FakeServer(_roads())
+    server.version_gates = {"abc123": threading.Event(), "v2": threading.Event()}
+    dock, _ = make_dock(server)
+    shown = _record_tooltips(monkeypatch, dock)
+    _hover(dock, "Roads")
+    server.datasets = _roads(quicklook_version="v2", description="Resurfaced")
+    dock.search()
+    _hover(dock, "Roads")
+    shown.clear()
+    first, second = ("abc123", "v2") if v1_first else ("v2", "abc123")
+    server.version_gates[first].set()
+    QTest.qWait(300)
+    server.version_gates[second].set()
+    _wait_idle(dock)
+    images = [text for text in shown if "<img" in text]
+    assert len(images) == 1 and "Resurfaced" in images[0]
+    # The old image still serves its own version.
+    assert {key[2] for key in dock._thumbnails} == {"abc123", "v2"}
+
+
+def test_a_description_only_change_shows_the_new_text(make_dock, monkeypatch):
+    server = FakeServer(_roads())
+    server.version_gates = {"abc123": threading.Event()}
+    dock, _ = make_dock(server)
+    shown = _record_tooltips(monkeypatch, dock)
+    _hover(dock, "Roads")
+    server.datasets = _roads(description="Brand new words")
+    dock.search()
+    shown.clear()
+    server.version_gates["abc123"].set()
+    _wait_idle(dock)
+    assert "Brand new words" in shown[-1] and "<img" in shown[-1]
+
+
+def test_a_removed_preview_is_not_shown_when_the_fetch_finishes(make_dock, monkeypatch):
+    server = FakeServer(_roads())
+    server.version_gates = {"abc123": threading.Event()}
+    dock, _ = make_dock(server)
+    shown = _record_tooltips(monkeypatch, dock)
+    _hover(dock, "Roads")
+    server.datasets = _roads(has_quicklook=False, quicklook_version=None)
+    dock.search()
+    shown.clear()
+    server.version_gates["abc123"].set()
+    _wait_idle(dock)
+    assert shown == []
+
+
+@pytest.mark.parametrize(
+    "first, second, expected",
+    [
+        ("2026-10-01T12:00:00Z", "2026-10-01T12:00:00.500Z", "second"),
+        ("2026-10-01T12:00:00+02:00", "2026-10-01T11:00:00Z", "second"),
+        ("2026-10-01T12:00:00Z", "2026-10-01T12:00:00+00:00", "tie"),
+        ("2026-10-01T12:00:00.5Z", "2026-10-01T12:00:00.250000Z", "first"),
+        ("2026-10-01", "not a date", "first"),
+    ],
+)
+def test_instants_compare_by_time_not_by_text(first, second, expected):
+    one, two = geolens_dock._instant(first), geolens_dock._instant(second)
+    if expected == "second":
+        assert two > one
+    elif expected == "first":
+        assert one is not None and (two is None or one > two)
+    else:
+        assert one == two
+
+
+def test_newest_first_orders_by_instant_and_puts_bad_dates_last(make_dock):
+    dates = {
+        "a": "2026-10-01T12:00:00Z",
+        "b": "2026-10-01T12:00:00.500Z",
+        "c": "2026-10-01T12:00:00+02:00",
+        "d": "garbage",
+        "e": "2026-10-01T11:00:00+00:00",
+    }
+    server = FakeServer([_feature(i, i, updated=d) for i, d in dates.items()])
+    dock, _ = make_dock(server)
+    dock.sort_combo.setCurrentIndex(dock.sort_combo.findData("newest"))
+    assert _titles(dock) == ["b", "a", "e", "c", "d"]
+
+
+def test_newest_first_needs_at_least_one_valid_date(make_dock):
+    server = FakeServer([_feature("a", "A", updated="garbage")])
+    dock, _ = make_dock(server)
+    item = dock.sort_combo.model().item(dock.sort_combo.findData("newest"))
+    assert not item.isEnabled()
