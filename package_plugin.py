@@ -10,7 +10,7 @@ from pathlib import Path
 
 PLUGIN_DIR = Path(__file__).parent / "geolens_qgis"
 EXCLUDED_DIRS = {"__pycache__", ".pytest_cache", ".git", "dist"}
-EXCLUDED_FILES = (re.compile(r".*\.(?:pyc|pyo)$"), re.compile(r".*~$"))
+EXCLUDED_FILES = (re.compile(r".*\.(?:pyc|pyo|ts)$"), re.compile(r".*~$"))
 
 
 def metadata_version(source: Path) -> str:

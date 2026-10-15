@@ -80,6 +80,7 @@ def _install_qgis_stub():
         "QgsRasterLayer",
         "QgsRectangle",
         "QgsRenderContext",
+        "QgsSettings",
         "QgsSimpleMarkerSymbolLayerBase",
         "QgsTask",
         "QgsVectorFileWriter",
