@@ -27,6 +27,7 @@ from .client import (
     same_origin,
     with_default_scheme,
 )
+from .i18n import tr
 
 SERVER_SETTING = "geolens/server"
 AUTHCFG_SETTING = "geolens/authcfg"
@@ -92,9 +93,11 @@ class QgisTransport:
             )
             if not applied or not _carries_credential(network_request):
                 raise GeoLensError(
-                    "The selected QGIS authentication configuration can't be "
-                    "used with GeoLens. Choose an API Header configuration that "
-                    "sends X-Api-Key."
+                    tr(
+                        "The selected QGIS authentication configuration can't be "
+                        "used with GeoLens. Choose an API Header configuration "
+                        "that sends X-Api-Key."
+                    )
                 )
         credential = _carries_credential(network_request)
         if timeout:
@@ -135,8 +138,10 @@ class QgisTransport:
         final = urlparse(reply.request().url().toString())
         if credential and final.hostname and reply.request().url() != QUrl(url):
             raise GeoLensError(
-                f"GeoLens redirected the request to {final.scheme}://"
-                f"{final.hostname}. Update the server URL to match."
+                tr(
+                    "GeoLens redirected the request to {target}. Update the "
+                    "server URL to match."
+                ).format(target=f"{final.scheme}://{final.hostname}")
             )
         body = bytes(reply.content())
         status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
@@ -276,7 +281,9 @@ def store_api_key(
     """
     auth_manager = auth_manager or QgsApplication.authManager()
     if not auth_manager.masterPasswordIsSet():
-        intro += " QGIS will ask for its master password."
+        intro = tr("{message} QGIS will ask for its master password.").format(
+            message=intro
+        )
     notify(intro, Qgis.MessageLevel.Info)
     config = QgsAuthMethodConfig("APIHeader")
     config.setName(f"GeoLens API key ({urlparse(server_url).netloc or server_url})")
@@ -318,14 +325,17 @@ def migrate_plaintext_key(settings, notify, auth_manager=None) -> str:
         key,
         server_url,
         notify,
-        "Moving your saved GeoLens API key into the QGIS authentication database.",
+        tr("Moving your saved GeoLens API key into the QGIS authentication database."),
         auth_manager,
     )
     if not authcfg:
         notify(
-            "Your GeoLens API key could not be moved into the QGIS "
-            "authentication database, so it stays in the QGIS profile settings "
-            "for now. GeoLens will try again in your next QGIS session.",
+            tr(
+                "Your GeoLens API key could not be moved into the QGIS "
+                "authentication database, so it stays in the QGIS profile "
+                "settings for now. GeoLens will try again in your next QGIS "
+                "session."
+            ),
             Qgis.MessageLevel.Warning,
         )
         return ""
@@ -334,8 +344,10 @@ def migrate_plaintext_key(settings, notify, auth_manager=None) -> str:
     forget_legacy_key(settings)
     settings.sync()
     notify(
-        "Your GeoLens API key is now in the QGIS authentication database, and "
-        "the plain-text copy was removed.",
+        tr(
+            "Your GeoLens API key is now in the QGIS authentication database, "
+            "and the plain-text copy was removed."
+        ),
         Qgis.MessageLevel.Success,
     )
     return authcfg

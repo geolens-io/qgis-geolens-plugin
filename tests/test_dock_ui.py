@@ -12,7 +12,7 @@ import pytest
 pytest.importorskip("pytest_qgis")
 
 from qgis.core import Qgis, QgsProject  # noqa: E402
-from qgis.PyQt.QtCore import QEvent, QPoint, Qt  # noqa: E402
+from qgis.PyQt.QtCore import QEvent, QLocale, QPoint, Qt  # noqa: E402
 from qgis.PyQt.QtGui import QHelpEvent, QImage  # noqa: E402
 from qgis.PyQt.QtTest import QTest  # noqa: E402
 from qgis.PyQt.QtWidgets import QApplication, QCheckBox  # noqa: E402
@@ -125,6 +125,14 @@ def _connect(dock, url, key=""):
     dock.use_server(url)
     dock.key_edit.setText(key)
     dock.connect_server()
+
+
+@pytest.fixture(autouse=True)
+def english_numbers():
+    previous = QLocale()
+    QLocale.setDefault(QLocale("en_US"))
+    yield
+    QLocale.setDefault(previous)
 
 
 @pytest.fixture
@@ -754,3 +762,10 @@ def test_connecting_with_a_blank_search_box_asks_once(make_dock):
     dock, server = make_dock()
     searches = [s for s in server.seen if s[1] == "/api/search/datasets/"]
     assert len(searches) == 1 and dock._query == ""
+
+
+def test_counts_follow_the_default_locale(make_dock):
+    QLocale.setDefault(QLocale("de_DE"))
+    dock, _ = make_dock()
+    assert _row(dock, "Roads").text(1) == "1.200 features"
+    assert geolens_dock.count_text(1200, "{count} a", "{count} b") == "1.200 b"

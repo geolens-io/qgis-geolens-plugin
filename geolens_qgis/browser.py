@@ -18,6 +18,7 @@ from qgis.core import (
     QgsMimeDataUtils,
 )
 from qgis.gui import QgsCustomDropHandler
+from qgis.PyQt.QtCore import QLocale
 from qgis.PyQt.QtGui import QIcon
 from qgis.PyQt.QtWidgets import QAction
 
@@ -266,7 +267,7 @@ class GeoLensMoreItem(QgsDataItem):
             tr(
                 "This list shows the first {count} datasets by title. Search in "
                 "the GeoLens panel to find the others."
-            ).format(count=f"{BROWSER_LIMIT:,}")
+            ).format(count=QLocale().toString(BROWSER_LIMIT))
         )
 
     def handleDoubleClick(self):
