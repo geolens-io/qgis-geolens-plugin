@@ -294,6 +294,23 @@ def _has_value(layer, column: str, values: list[float]) -> bool:
     return any(True for _ in layer.getFeatures(request))
 
 
+def _overlaps(configured) -> bool:
+    """Whether a value can fall in two ranges and QGIS would not pick the lower.
+
+    QGIS uses the first matching range in configured order. The converter gives
+    an edge value to the lower range, so ranges that only touch overlap just
+    when the higher one is configured first.
+    """
+    ordered = sorted(enumerate(configured), key=lambda pair: pair[1].lowerValue())
+    reach, owner = -math.inf, -1
+    for position, r in ordered:
+        if r.lowerValue() < reach or (r.lowerValue() == reach and position < owner):
+            return True
+        if r.upperValue() >= reach:
+            reach, owner = r.upperValue(), position
+    return False
+
+
 def _graduated(layer, renderer, losses: LossLog) -> RenderedStyle:
     ranges = sorted(renderer.ranges(), key=lambda r: r.lowerValue())
     column = _class_column(layer, renderer, ranges, losses)
@@ -307,6 +324,13 @@ def _graduated(layer, renderer, losses: LossLog) -> RenderedStyle:
     )
     method = _METHODS.get(renderer.classificationMethod().id(), "manual")
     edges = [r.upperValue() for r in ranges[:-1]]
+    if _overlaps(renderer.ranges()):
+        # QGIS draws the first matching range; a step expression cannot.
+        losses.add(
+            "filter_not_representable",
+            "renderer.ranges",
+            "overlapping ranges (QGIS uses the first match)",
+        )
     breaks = _shift_breaks(layer, column, edges, losses)
     kind = styles[0].style.kind
     lead = _lead(styles)
@@ -429,9 +453,23 @@ def _cluster(renderer, losses: LossLog) -> RenderedStyle:
     )
     symbol = renderer.clusterSymbol()
     drawn = (
-        [layer for layer in symbol.symbolLayers() if layer.enabled()] if symbol else []
+        [(i, layer) for i, layer in enumerate(symbol.symbolLayers()) if layer.enabled()]
+        if symbol
+        else []
     )
     if drawn:
+        used = {drawn[0][0]}
+        for index, symbol_layer in drawn:
+            if symbol_layer.layerType() == "FontMarker":
+                used = {drawn[0][0], index}
+        for index, symbol_layer in drawn:
+            if index not in used:
+                losses.add(
+                    "symbol_layer_dropped",
+                    f"renderer.clusterSymbol[{index}]",
+                    symbol_layer.layerType(),
+                )
+        drawn = [symbol_layer for _, symbol_layer in drawn]
         builder["clusterColor"] = drawn[0].color().name()
         first = drawn[0]
         if first.layerType() != "SimpleMarker":

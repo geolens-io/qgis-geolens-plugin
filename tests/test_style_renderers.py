@@ -37,6 +37,7 @@ from qgis.core import (  # noqa: E402
     QgsRasterLayer,
     QgsRendererCategory,
     QgsRendererRange,
+    QgsSimpleMarkerSymbolLayer,
     QgsSingleSymbolRenderer,
     QgsSymbol,
     QgsVectorLayer,
@@ -927,6 +928,49 @@ def test_graduated_reports_data_that_sits_on_a_class_edge():
     ]
 
 
+def test_graduated_reports_overlapping_ranges():
+    layer = pop_layer()
+    ranges = [
+        QgsRendererRange(0, 100, colored(COLORS[0]), "wide"),
+        QgsRendererRange(10, 20, colored(COLORS[1]), "inside"),
+        QgsRendererRange(30, 40, colored(COLORS[2]), "also inside"),
+    ]
+    layer.setRenderer(QgsGraduatedSymbolRenderer("pop", ranges))
+    assert (
+        loss(
+            "filter_not_representable",
+            "renderer.ranges",
+            "overlapping ranges (QGIS uses the first match)",
+        )
+        in convert(layer)[1]
+    )
+
+
+def test_graduated_ranges_that_touch_in_reverse_order_are_overlapping():
+    layer = pop_layer()
+    ranges = [
+        QgsRendererRange(10, 20, colored(COLORS[0]), "high"),
+        QgsRendererRange(0, 10, colored(COLORS[1]), "low"),
+    ]
+    layer.setRenderer(QgsGraduatedSymbolRenderer("pop", ranges))
+    assert (
+        loss(
+            "filter_not_representable",
+            "renderer.ranges",
+            "overlapping ranges (QGIS uses the first match)",
+        )
+        in convert(layer)[1]
+    )
+
+
+def test_graduated_ranges_that_only_touch_are_not_overlapping():
+    layer = pop_layer()
+    layer.setRenderer(
+        graduated("pop", [colored(c) for c in COLORS], [0, 10, 100, 1000])
+    )
+    assert all(item["kind"] != "filter_not_representable" for item in convert(layer)[1])
+
+
 def test_graduated_on_an_integer_field_moves_each_edge_up_by_one():
     layer = pop_layer("i", values=(5, 10, 500))
     layer.setRenderer(
@@ -1247,6 +1291,29 @@ def test_cluster_keeps_the_radius_the_cluster_colours_and_the_point_symbol():
         "circle-color": "#ff0000",
     }
     assert losses == [CLUSTER_SIZE]
+
+
+def test_extra_cluster_symbol_layers_are_reported_as_dropped():
+    layer = pop_layer()
+    renderer = QgsPointClusterRenderer()
+    renderer.setEmbeddedRenderer(QgsSingleSymbolRenderer(colored("#ff0000")))
+    cluster = marker(color="#0000ff", outline_style="no")
+    cluster.appendSymbolLayer(
+        QgsSimpleMarkerSymbolLayer.create({"color": "#00ff00", "size": "3"})
+    )
+    cluster.appendSymbolLayer(
+        QgsFontMarkerSymbolLayer("Arial", "1", 8, QColor("#ffffff"))
+    )
+    cluster.appendSymbolLayer(
+        QgsSimpleMarkerSymbolLayer.create({"color": "#ffff00", "size": "4"})
+    )
+    renderer.setClusterSymbol(cluster)
+    layer.setRenderer(renderer)
+    assert convert(layer)[1] == [
+        loss("symbol_layer_dropped", "renderer.clusterSymbol[1]", "SimpleMarker"),
+        loss("symbol_layer_dropped", "renderer.clusterSymbol[3]", "SimpleMarker"),
+        CLUSTER_SIZE,
+    ]
 
 
 def test_a_translucent_cluster_symbol_is_reported():
