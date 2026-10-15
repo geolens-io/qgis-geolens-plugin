@@ -724,3 +724,33 @@ def test_newest_first_needs_at_least_one_valid_date(make_dock):
     dock, _ = make_dock(server)
     item = dock.sort_combo.model().item(dock.sort_combo.findData("newest"))
     assert not item.isEnabled()
+
+
+def test_connecting_with_search_text_lists_only_its_matches(make_dock):
+    class Filtering(FakeServer):
+        def __call__(self, request, timeout=0):
+            query = parse_qs(urlparse(request.full_url).query).get("q", [""])[0]
+            if query:
+                self.datasets = [
+                    d
+                    for d in DATASETS
+                    if query.lower() in d["properties"]["title"].lower()
+                ]
+            return super().__call__(request, timeout)
+
+    server = Filtering()
+    dock, _ = make_dock(connect=False)
+    dock._opener = server
+    server.dock = dock
+    dock.search_edit.setText("roads")
+    _connect(dock, SERVER)
+    assert _titles(dock) == ["Roads"]
+    assert dock._query == "roads"
+    searches = [s for s in server.seen if s[1] == "/api/search/datasets/"]
+    assert len(searches) == 2
+
+
+def test_connecting_with_a_blank_search_box_asks_once(make_dock):
+    dock, server = make_dock()
+    searches = [s for s in server.seen if s[1] == "/api/search/datasets/"]
+    assert len(searches) == 1 and dock._query == ""
