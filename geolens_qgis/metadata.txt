@@ -16,6 +16,7 @@ tags=geolens,catalog,ogc api features,vector tiles,raster tiles,postgis
 experimental=False
 deprecated=False
 hasProcessingProvider=no
+supportsQt6=True
 
 changelog=
     0.1.0 - Initial experimental release
