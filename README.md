@@ -2,8 +2,6 @@
 
 A QGIS plugin for browsing and using datasets from a self-hosted GeoLens server. It brings the [GeoLens](https://github.com/geolens-io/geolens) catalog workflow from [GeoLibre](https://github.com/opengeos/GeoLibre) into QGIS.
 
-This is a community project and is not affiliated with, or endorsed by, any GeoLens vendor.
-
 ## Features
 
 - Connect to any GeoLens server. Private data uses an API key kept in the QGIS authentication database, or pasted for one session.
