@@ -116,6 +116,10 @@ class Dataset:
     feature_count: int | None
     band_count: int | None
     bbox: tuple[float, float, float, float] | None
+    keywords: tuple[str, ...] = ()
+    license: str | None = None
+    language: str | None = None
+    source_organization: str | None = None
 
     @property
     def is_raster(self) -> bool:
@@ -210,6 +214,12 @@ class GeoLensClient:
             "publish_contract": None,
             "document": {},
         }
+
+    def dataset_detail(self, dataset_id: str) -> dict[str, Any]:
+        body = self._request(f"/api/datasets/{quote(dataset_id, safe='')}")
+        if not isinstance(body, dict):
+            raise GeoLensError("GeoLens dataset response was malformed")
+        return body
 
     def tile_source(self, dataset_id: str) -> dict[str, Any]:
         body = self._request(f"/api/tiles/token/{quote(dataset_id, safe='')}/")
@@ -316,6 +326,14 @@ def parse_dataset(feature: Any) -> Dataset | None:
         feature_count=props.get("feature_count"),
         band_count=props.get("band_count"),
         bbox=_geometry_bbox(feature.get("geometry")),
+        keywords=tuple(
+            word
+            for word in (props.get("keywords") or ())
+            if isinstance(word, str) and word.strip()
+        ),
+        license=props.get("license"),
+        language=props.get("language"),
+        source_organization=props.get("source_organization"),
     )
 
 

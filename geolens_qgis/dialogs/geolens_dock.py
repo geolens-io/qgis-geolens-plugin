@@ -59,6 +59,7 @@ from ..connection import (
     origin_label,
     store_api_key,
 )
+from ..layer_info import apply_layer_info
 
 ROLE_DATASET = Qt.ItemDataRole.UserRole
 # QgsJsonExporter writes six decimal places by default (RFC 7946).
@@ -475,6 +476,7 @@ class GeoLensDock(QDockWidget):
         layer.setCustomProperty(
             "geolens/metadata_url", self.client.metadata_url(dataset.id)
         )
+        apply_layer_info(layer, dataset, self.client)
 
     def _add_raster(self, dataset, source):
         layer = QgsRasterLayer(self._uri(source), dataset.title, "wms")
