@@ -20,7 +20,7 @@ This is a community project and is not affiliated with, or endorsed by, any GeoL
 Clone the repository and link its plugin directory into your active QGIS profile:
 
 ```bash
-git clone https://github.com/opengeos/qgis-geolens-plugin.git
+git clone https://github.com/geolens-io/qgis-geolens-plugin.git
 cd qgis-geolens-plugin
 python install.py
 ```
