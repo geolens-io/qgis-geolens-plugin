@@ -4,19 +4,18 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 description=Browse, visualize, and edit datasets hosted by a GeoLens server.
 about=Connect to public or private GeoLens catalogs. Search datasets, open metadata, add signed vector tiles, add raster XYZ tiles, or load OGC API Features as editable QGIS layers. Edited feature layers can be synchronized back to GeoLens when server-side editing is enabled.
-version=0.1.0
+version=0.2.0
 author=Qiusheng Wu
 email=giswqs@gmail.com
-repository=https://github.com/opengeos/qgis-geolens-plugin
-tracker=https://github.com/opengeos/qgis-geolens-plugin/issues
-homepage=https://github.com/opengeos/qgis-geolens-plugin
+repository=https://github.com/geolens-io/qgis-geolens-plugin
+tracker=https://github.com/geolens-io/qgis-geolens-plugin/issues
+homepage=https://github.com/geolens-io/qgis-geolens-plugin
 category=Web
 icon=icons/icon.svg
 tags=geolens,catalog,ogc api features,vector tiles,raster tiles,postgis
 experimental=False
 deprecated=False
 hasProcessingProvider=no
-supportsQt6=True
 
 changelog=
     0.1.0 - Initial experimental release

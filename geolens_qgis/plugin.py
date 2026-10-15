@@ -77,6 +77,6 @@ class GeoLensPlugin:
             "About GeoLens",
             "<h3>GeoLens for QGIS</h3>"
             "<p>Browse, visualize, and edit datasets hosted by a GeoLens server.</p>"
-            '<p><a href="https://github.com/opengeos/qgis-geolens-plugin">'
+            '<p><a href="https://github.com/geolens-io/qgis-geolens-plugin">'
             "Source code and documentation</a></p>",
         )
