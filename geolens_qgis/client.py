@@ -64,8 +64,8 @@ _DEFAULT_PORTS = {"http": 80, "https": 443}
 
 
 def _server_key(url: str) -> tuple[str, str, int | None, str] | None:
-    parsed = urlparse(url.strip())
     try:
+        parsed = urlparse(url.strip())
         port = parsed.port
     except ValueError:
         return None
@@ -85,6 +85,25 @@ def same_server(first: str, second: str) -> bool:
     """
     key = _server_key(first)
     return key is not None and key == _server_key(second)
+
+
+def same_origin(first: str, second: str) -> bool:
+    """Whether two URLs share a scheme, host and port, whatever their paths.
+
+    A URL without a scheme is read as HTTPS, as the Server field reads it.
+    A URL without an HTTP(S) scheme and host never matches.
+    """
+    key = _server_key(with_default_scheme(first))
+    other = _server_key(with_default_scheme(second))
+    return key is not None and other is not None and key[:3] == other[:3]
+
+
+def with_default_scheme(url: str) -> str:
+    """`url` stripped, with `https://` in front when it names no HTTP(S) scheme."""
+    raw = url.strip()
+    if raw and not raw.lower().startswith(("http://", "https://")):
+        raw = "https://" + raw
+    return raw
 
 
 @dataclass(frozen=True)
@@ -110,9 +129,7 @@ class GeoLensClient:
         api_key: str = "",
         opener: Callable = urlopen,
     ):
-        raw = base_url.strip()
-        if raw and not raw.lower().startswith(("http://", "https://")):
-            raw = "https://" + raw
+        raw = with_default_scheme(base_url)
         parsed = urlparse(raw)
         if parsed.scheme not in ("http", "https") or not parsed.netloc:
             raise ValueError("GeoLens URL must be an HTTP(S) server URL")

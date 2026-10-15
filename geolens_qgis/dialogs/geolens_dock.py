@@ -8,7 +8,7 @@ import os
 import tempfile
 import webbrowser
 
-from qgis.PyQt.QtCore import Qt, QSettings, QTimer
+from qgis.PyQt.QtCore import QCoreApplication, Qt, QSettings, QTimer
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -40,13 +40,23 @@ from qgis.core import (
 )
 from qgis.gui import QgsAuthConfigSelect
 
-from ..client import Dataset, GeoLensError, refresh_delay_seconds, same_server
+from ..client import (
+    Dataset,
+    GeoLensError,
+    refresh_delay_seconds,
+    same_origin,
+    same_server,
+)
 from ..connection import (
     AUTHCFG_SETTING,
     LEGACY_KEY_SETTING,
     SERVER_SETTING,
     GeoLensConnection,
+    auth_server_mismatch,
+    forget_legacy_key,
+    legacy_key_server,
     migrate_plaintext_key,
+    origin_label,
     store_api_key,
 )
 
@@ -72,6 +82,13 @@ class GeoLensDock(QDockWidget):
         self.temp_files: list[str] = []
         self.refresh_timers: dict[str, QTimer] = {}
         self.editing_enabled = False
+        self._credential_warning = ""
+        # A plain-text key from an older version and its server, kept while
+        # the user hasn't typed over it so a return to that server refills it.
+        self._legacy_key = ""
+        self._legacy_key_server = ""
+        # The auth config last deselected for another server.
+        self._dropped_authcfg = ""
         self._build_ui()
         self._restore_settings()
 
@@ -93,12 +110,15 @@ class GeoLensDock(QDockWidget):
         form = QFormLayout()
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText("https://datasets.geolibre.app")
+        self.url_edit.editingFinished.connect(self._server_edited)
         self.auth_select = QgsAuthConfigSelect(self)
+        self.auth_select.selectedConfigIdChanged.connect(self._auth_selection_changed)
         self.key_edit = QLineEdit()
         self.key_edit.setPlaceholderText(
             "Optional; used instead of the authentication above"
         )
         self.key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self.key_edit.textEdited.connect(self._forget_legacy_key_field)
         self.save_key = QCheckBox("Save API key in the QGIS authentication database")
         self.save_key.setToolTip(
             "The key is encrypted with the QGIS master password. Unchecked, "
@@ -172,9 +192,33 @@ class GeoLensDock(QDockWidget):
         self.url_edit.setText(settings.value(SERVER_SETTING, "", str))
         migrate_plaintext_key(settings, self._message)
         self.auth_select.setConfigId(settings.value(AUTHCFG_SETTING, "", str))
-        # A key that could not be moved yet still works for this session.
-        self.key_edit.setText(settings.value(LEGACY_KEY_SETTING, "", str))
+        self._restore_legacy_key(settings)
         self.limit.setValue(settings.value("geolens/feature_limit", 10000, int))
+
+    def _restore_legacy_key(self, settings):
+        """Fill in a key that could not be moved yet, for its own server only."""
+        key = settings.value(LEGACY_KEY_SETTING, "", str).strip()
+        if not key:
+            return
+        server = legacy_key_server(settings)
+        if not server:
+            self._message(
+                QCoreApplication.translate(
+                    "GeoLens",
+                    "An API key saved by an older version of GeoLens doesn't "
+                    "record which server it belongs to, so it isn't filled in. "
+                    "Paste it again for its server.",
+                ),
+                Qgis.MessageLevel.Warning,
+            )
+            return
+        self._legacy_key, self._legacy_key_server = key, server
+        if same_origin(server, self.url_edit.text()):
+            self.key_edit.setText(key)
+
+    def _forget_legacy_key_field(self, *_):
+        # A key the user typed belongs to whatever server they typed it for.
+        self._legacy_key = ""
 
     def _choose_sample(self, index):
         url = self.samples.itemData(index)
@@ -182,6 +226,8 @@ class GeoLensDock(QDockWidget):
             self.url_edit.setText(url)
             self.auth_select.setConfigId("")
             self.key_edit.clear()
+            self._legacy_key = ""
+            self._forget_credential_warning()
 
     def _selected_dataset(self) -> Dataset | None:
         items = self.results.selectedItems()
@@ -210,8 +256,109 @@ class GeoLensDock(QDockWidget):
         self.status.setText(text)
         self.iface.messageBar().pushMessage("GeoLens", text, level=level, duration=6)
 
+    def _drop_credentials_for_other_server(self):
+        """Clear a filled-in legacy key or auth config saved for another server."""
+        url = self.url_edit.text()
+        if not url.strip():
+            return
+        reasons = []
+        legacy = self._legacy_key
+        if legacy and self.key_edit.text().strip() == legacy:
+            if not same_origin(self._legacy_key_server, url):
+                self.key_edit.clear()
+                reasons.append(
+                    QCoreApplication.translate(
+                        "GeoLens",
+                        "The saved API key belongs to {saved}, so GeoLens won't "
+                        "send it to {target}. It is no longer filled in.",
+                    ).format(
+                        saved=origin_label(self._legacy_key_server),
+                        target=origin_label(url),
+                    )
+                )
+        authcfg = self.auth_select.configId()
+        mismatch = auth_server_mismatch(authcfg, url) if authcfg else ""
+        if mismatch:
+            self.auth_select.setConfigId("")
+            self._dropped_authcfg = authcfg
+            reasons.append(
+                mismatch
+                + " "
+                + QCoreApplication.translate(
+                    "GeoLens", "The configuration is no longer selected."
+                )
+            )
+        if not reasons:
+            return
+        # Editing the URL and clicking Connect clears on focus loss before
+        # the click lands, so the click must still refuse once.
+        self._credential_warning = " ".join(
+            reasons
+            + [
+                QCoreApplication.translate(
+                    "GeoLens", "Click Connect again to connect without it."
+                )
+            ]
+        )
+        self._message(self._credential_warning, Qgis.MessageLevel.Warning)
+
+    def _restore_credentials_for_this_server(self):
+        """Bring back a legacy key or dropped auth config the server owns again."""
+        url = self.url_edit.text()
+        restored = []
+        if (
+            self._legacy_key
+            and not self.key_edit.text()
+            and same_origin(self._legacy_key_server, url)
+        ):
+            self.key_edit.setText(self._legacy_key)
+            restored.append(
+                QCoreApplication.translate(
+                    "GeoLens", "The saved API key for {server} is filled in."
+                ).format(server=origin_label(url))
+            )
+        dropped = self._dropped_authcfg
+        if (
+            dropped
+            and not self.auth_select.configId()
+            and not auth_server_mismatch(dropped, url)
+        ):
+            self.auth_select.setConfigId(dropped)
+            restored.append(
+                QCoreApplication.translate(
+                    "GeoLens",
+                    "The authentication configuration saved for {server} is "
+                    "selected again.",
+                ).format(server=origin_label(url))
+            )
+        if restored:
+            self._forget_credential_warning()
+            self._message(" ".join(restored))
+
+    def _forget_credential_warning(self, *_):
+        self._credential_warning = ""
+
+    def _auth_selection_changed(self, *_):
+        # Any pick, including clearing it, supersedes a deselection.
+        self._forget_credential_warning()
+        self._dropped_authcfg = ""
+
+    def _server_edited(self):
+        # A refusal is meant for the Connect click that ends this edit, not
+        # for a server typed after it.
+        self._forget_credential_warning()
+        self._drop_credentials_for_other_server()
+        self._restore_credentials_for_this_server()
+
     def connect_server(self):
+        self._drop_credentials_for_other_server()
+        self._restore_credentials_for_this_server()
         key = self.key_edit.text().strip()
+        warning, self._credential_warning = self._credential_warning, ""
+        if warning and not key:
+            self._disconnect()
+            self._message(warning, Qgis.MessageLevel.Warning)
+            return
         try:
             connection = GeoLensConnection(
                 self.url_edit.text(),
@@ -263,7 +410,7 @@ class GeoLensDock(QDockWidget):
             return
         settings = QSettings()
         if settings.value(LEGACY_KEY_SETTING, "", str).strip() == key:
-            settings.remove(LEGACY_KEY_SETTING)
+            forget_legacy_key(settings)
         self.auth_select.setConfigId(authcfg)
         self.key_edit.clear()
         self.save_key.setChecked(False)

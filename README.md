@@ -51,8 +51,19 @@ versions could keep the key in plain text in the profile settings; opening the
 GeoLens panel moves such a key into the authentication database and deletes
 the plain-text copy. If that move fails or you cancel the master password
 prompt, the key stays where it was and the panel tries again in your next QGIS
-session. No key
+session. Until then the panel fills the key in only for the server it was saved
+with: it clears the key when the server URL changes to another server and
+fills it in again when the URL changes back. A key saved
+without a server URL isn't filled in or moved; paste it again with **Save API
+key** ticked. No key
 is written to a layer source or a project file.
+
+An authentication configuration is sent only to the server in its URL field:
+the same scheme, host and port. Configurations the plugin saves record the
+server they were saved for. A configuration you create yourself needs that URL
+set, or the panel won't use it. Changing the server URL to another server
+deselects a configuration saved for a different one, and changing it back
+selects that configuration again.
 
 Private vector and raster tiles load with a short-lived signed token that the
 plugin renews while the layer is open. No API key is written into a layer

@@ -9,6 +9,7 @@ from geolens_qgis.client import (
     parse_dataset,
     parse_tile_scope,
     refresh_delay_seconds,
+    same_origin,
     same_server,
 )
 
@@ -181,6 +182,25 @@ class ClientTests(unittest.TestCase):
             with self.subTest(other=other):
                 self.assertFalse(same_server("https://gis.example.org", other))
         self.assertFalse(same_server("", ""))
+
+    def test_same_origin_ignores_paths_but_not_scheme_host_or_port(self):
+        for other in (
+            "HTTPS://GIS.Example.org:443/geolens/",
+            "gis.example.org/other",
+        ):
+            with self.subTest(other=other):
+                self.assertTrue(same_origin("https://gis.example.org", other))
+        for other in (
+            "http://gis.example.org",
+            "https://gis.example.org:8443",
+            "https://other.example.org",
+            "",
+            "https://[",
+        ):
+            with self.subTest(other=other):
+                self.assertFalse(same_origin("https://gis.example.org", other))
+        self.assertFalse(same_origin("", ""))
+        self.assertFalse(same_server("https://[::1", "https://[::1"))
 
     def test_parses_tile_scopes(self):
         self.assertEqual(parse_tile_scope("roads:p3"), ("roads", "3"))
