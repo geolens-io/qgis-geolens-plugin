@@ -32,3 +32,25 @@ def test_opens_the_dock_and_unload_removes_it(plugin):
     assert not plugin.dock.isHidden()
     plugin.unload()
     assert plugin.dock is None
+
+
+def test_the_first_click_shows_the_dock_and_the_next_hides_it(
+    plugin, qgis_iface, monkeypatch, request
+):
+    # QGIS shows a dock as soon as it is added; pytest-qgis's interface doesn't.
+    add = qgis_iface.addDockWidget
+
+    def add_and_show(area, dock):
+        add(area, dock)
+        dock.show()
+
+    monkeypatch.setattr(qgis_iface, "addDockWidget", add_and_show)
+    qgis_iface.mainWindow().show()
+    request.addfinalizer(qgis_iface.mainWindow().hide)
+    plugin.initGui()
+    plugin.toggle_dock()
+    assert plugin.dock.isVisible()
+    plugin.toggle_dock()
+    assert not plugin.dock.isVisible()
+    plugin.toggle_dock()
+    assert plugin.dock.isVisible()

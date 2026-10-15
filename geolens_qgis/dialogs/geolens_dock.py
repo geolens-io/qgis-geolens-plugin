@@ -148,6 +148,7 @@ class GeoLensDock(QDockWidget):
         self.results.setHeaderLabels(["Dataset", "Type", "Features"])
         self.results.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.results.itemSelectionChanged.connect(self._update_actions)
+        self.iface.currentLayerChanged.connect(self._update_actions)
         layout.addWidget(self.results, 1)
 
         options = QFormLayout()
@@ -233,7 +234,7 @@ class GeoLensDock(QDockWidget):
         items = self.results.selectedItems()
         return items[0].data(0, ROLE_DATASET) if items else None
 
-    def _update_actions(self):
+    def _update_actions(self, *_):
         dataset = self._selected_dataset()
         connected = self.client is not None
         self.tiles_button.setEnabled(connected and dataset is not None)
@@ -756,11 +757,13 @@ class GeoLensDock(QDockWidget):
             self._message(f"Synchronized {total} change(s) to GeoLens.")
 
     def cleanup(self):
-        """Stop tile refresh timers and delete downloaded feature files.
+        """Stop following the active layer and tile refresh timers, and delete
+        downloaded feature files.
 
         Called by the plugin on unload; hiding the dock deliberately keeps
         everything alive so a reopened dock resumes where it left off.
         """
+        self.iface.currentLayerChanged.disconnect(self._update_actions)
         for timer in self.refresh_timers.values():
             timer.stop()
         self.refresh_timers.clear()
