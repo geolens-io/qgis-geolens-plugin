@@ -1,0 +1,608 @@
+"""The dock's list, filters, states and messages against a real QGIS."""
+
+import contextlib
+import json
+import threading
+from io import BytesIO
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, urlparse
+
+import pytest
+
+pytest.importorskip("pytest_qgis")
+
+from qgis.core import Qgis, QgsProject  # noqa: E402
+from qgis.PyQt.QtCore import QEvent, QPoint, Qt  # noqa: E402
+from qgis.PyQt.QtGui import QHelpEvent, QImage  # noqa: E402
+from qgis.PyQt.QtTest import QTest  # noqa: E402
+from qgis.PyQt.QtWidgets import QApplication, QCheckBox  # noqa: E402
+
+from geolens_qgis.client import GeoLensError  # noqa: E402
+from geolens_qgis.dialogs import geolens_dock  # noqa: E402
+from geolens_qgis.dialogs.geolens_dock import GeoLensDock, plain_error  # noqa: E402
+
+SERVER = "https://gis.example.org"
+KEY = "glk_only_for_tests_bbbbbbbbbbbbbbbb"  # pragma: allowlist secret
+
+
+def _png():
+    image = QImage(8, 8, QImage.Format.Format_RGB32)
+    image.fill(0x336699)
+    from qgis.PyQt.QtCore import QBuffer, QByteArray
+
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QBuffer.OpenModeFlag.WriteOnly)
+    image.save(buffer, "PNG")
+    return bytes(data)
+
+
+def _feature(ident, title, **props):
+    return {"id": ident, "properties": {"title": title, **props}}
+
+
+DATASETS = [
+    _feature(
+        "roads",
+        "Roads",
+        record_type="vector_dataset",
+        geometry_type="MULTILINESTRING",
+        feature_count=1200,
+        updated="2026-10-01T00:00:00Z",
+        has_quicklook=True,
+        quicklook_version="abc123",
+    ),
+    _feature(
+        "parcels",
+        "parcels",
+        record_type="vector_dataset",
+        geometry_type="POLYGON",
+        feature_count=1,
+        updated="2026-10-10T00:00:00Z",
+    ),
+    _feature(
+        "dem",
+        "Elevation",
+        record_type="raster_dataset",
+        band_count=3,
+        updated="2026-09-01T00:00:00Z",
+        has_quicklook=True,
+        quicklook_version="v9",
+    ),
+]
+
+
+class FakeServer:
+    """An opener that serves `datasets` and records every request it sees."""
+
+    def __init__(self, datasets=DATASETS):
+        self.datasets = datasets
+        self.seen = []
+        self.timeouts = {}
+        self.quicklook_threads = []
+        self.gate = None
+        self.during_search = None
+
+    def __call__(self, request, timeout=0):
+        url = urlparse(request.full_url)
+        self.timeouts[url.path] = timeout
+        self.seen.append((url.netloc, url.path, request.get_header("X-api-key")))
+        path = url.path
+        if path == "/api/search/datasets/":
+            query = parse_qs(url.query).get("q", [""])[0]
+            if query:
+                self.during_search = (
+                    QApplication.overrideCursor() is not None,
+                    self.dock.status.text(),
+                )
+            features = [] if query == "nothing" else self.datasets
+            return BytesIO(json.dumps({"features": features}).encode())
+        if path == "/api/capabilities":
+            return BytesIO(b'{"flags": {"enable_dataset_editing": true}}')
+        if path == "/api/datasets/roads/quicklook":
+            self.quicklook_threads.append(threading.get_ident())
+            if self.gate is not None:
+                self.gate.wait(10)
+            return BytesIO(_png())
+        if path == "/api/tiles/token/dem/":
+            body = {
+                "kind": "raster",
+                "tile_url": "/raster-tiles/dem/{z}/{x}/{y}.png?sig=s",
+                "expires_in": 600,
+            }
+            return BytesIO(json.dumps(body).encode())
+        raise HTTPError(request.full_url, 404, "Not Found", {}, BytesIO(b"{}"))
+
+    def thumbnail_requests(self):
+        return [seen for seen in self.seen if seen[1].endswith("/quicklook")]
+
+
+def _connect(dock, url, key=""):
+    dock.use_server(url)
+    dock.key_edit.setText(key)
+    dock.connect_server()
+
+
+@pytest.fixture
+def make_dock(qgis_iface, qgis_app):
+    from qgis.PyQt.QtCore import QSettings
+
+    QSettings().remove("geolens")
+    docks = []
+
+    def make(server=None, connect=True):
+        server = server or FakeServer()
+        dock = GeoLensDock(qgis_iface, opener=server)
+        server.dock = dock
+        docks.append(dock)
+        dock.setFloating(True)
+        dock.resize(300, 700)
+        dock.show()
+        if connect:
+            _connect(dock, SERVER, KEY)
+        return dock, server
+
+    yield make
+    for dock in docks:
+        # One test cleans its dock up itself, and cleanup disconnects a signal.
+        with contextlib.suppress(TypeError):
+            dock.cleanup()
+    QgsProject.instance().clear()
+    QSettings().remove("geolens")
+
+
+def _fetched(dock, dataset):
+    """The dataset's preview once any background fetch has finished."""
+    dock._thumbnail(dataset)
+    for _ in range(100):
+        if not dock._pending:
+            break
+        QTest.qWait(50)
+    return next(
+        (data for key, data in dock._thumbnails.items() if key[1] == dataset.id), None
+    )
+
+
+def _titles(dock):
+    return [
+        dock.results.topLevelItem(i).text(0)
+        for i in range(dock.results.topLevelItemCount())
+    ]
+
+
+def _row(dock, title):
+    for i in range(dock.results.topLevelItemCount()):
+        if dock.results.topLevelItem(i).text(0) == title:
+            return dock.results.topLevelItem(i)
+    raise AssertionError(title)
+
+
+def test_before_connecting_the_list_says_how_to_start(make_dock):
+    dock, _ = make_dock(connect=False)
+    assert dock.status.text() == "Not connected."
+    assert dock.results.placeholder == (
+        "Connect to a GeoLens server to browse its datasets."
+    )
+    assert not dock.type_filter.isEnabled()
+
+
+def test_rows_show_a_type_icon_and_a_size_that_fits_a_narrow_dock(make_dock):
+    dock, _ = make_dock()
+    dock.resize(250, 700)
+    assert _row(dock, "Roads").text(1) == "1,200 features"
+    assert _row(dock, "parcels").text(1) == "1 feature"
+    assert _row(dock, "Elevation").text(1) == "3 bands"
+    assert not _row(dock, "Roads").icon(0).isNull()
+    assert (
+        _row(dock, "Roads").icon(0).cacheKey()
+        != _row(dock, "Elevation").icon(0).cacheKey()
+    )
+    # The title column takes the leftover width instead of the type and size.
+    assert dock.results.columnWidth(0) > dock.results.columnWidth(1)
+    assert "Line layer" in _row(dock, "Roads").toolTip(0)
+    assert "Double-click or press Enter" in _row(dock, "Roads").toolTip(0)
+
+
+def test_a_raster_with_no_band_count_shows_no_size(make_dock):
+    server = FakeServer([_feature("r", "Bare", record_type="raster_dataset")])
+    dock, _ = make_dock(server)
+    assert _row(dock, "Bare").text(1) == ""
+
+
+def test_the_type_filter_narrows_the_loaded_results(make_dock):
+    dock, server = make_dock()
+    seen = len(server.seen)
+    dock.type_filter.setCurrentIndex(dock.type_filter.findData("raster"))
+    assert _titles(dock) == ["Elevation"]
+    dock.type_filter.setCurrentIndex(dock.type_filter.findData("vector"))
+    assert sorted(_titles(dock)) == ["Roads", "parcels"]
+    assert len(server.seen) == seen
+    assert "2 of 3 datasets shown" in dock.status.text()
+
+
+def test_a_filter_that_hides_everything_says_so(make_dock):
+    server = FakeServer([DATASETS[0]])
+    dock, _ = make_dock(server)
+    dock.type_filter.setCurrentIndex(dock.type_filter.findData("raster"))
+    assert dock.results.topLevelItemCount() == 0
+    assert dock.results.placeholder == "No datasets match this filter."
+
+
+def test_sorting_by_title_ignores_case_and_newest_uses_the_date(make_dock):
+    dock, _ = make_dock()
+    assert _titles(dock) == ["Roads", "parcels", "Elevation"]
+    dock.sort_combo.setCurrentIndex(dock.sort_combo.findData("title"))
+    assert _titles(dock) == ["Elevation", "parcels", "Roads"]
+    dock.sort_combo.setCurrentIndex(dock.sort_combo.findData("newest"))
+    assert _titles(dock) == ["parcels", "Roads", "Elevation"]
+
+
+def test_newest_first_is_unavailable_when_no_dataset_has_a_date(make_dock):
+    server = FakeServer([_feature("a", "A"), _feature("b", "B")])
+    dock, _ = make_dock(server)
+    model = dock.sort_combo.model()
+    assert not model.item(dock.sort_combo.findData("newest")).isEnabled()
+    assert model.item(dock.sort_combo.findData("title")).isEnabled()
+
+
+def test_the_selection_survives_a_filter_change(make_dock):
+    dock, _ = make_dock()
+    dock.results.setCurrentItem(_row(dock, "Roads"))
+    dock.sort_combo.setCurrentIndex(dock.sort_combo.findData("title"))
+    assert dock._selected_dataset().id == "roads"
+
+
+def test_a_search_with_no_results_names_the_query(make_dock):
+    dock, _ = make_dock()
+    dock.search_edit.setText("nothing")
+    dock.search()
+    assert dock.results.topLevelItemCount() == 0
+    assert dock.results.placeholder == (
+        'No datasets found for "nothing". Try different words.'
+    )
+    assert dock.status.text().startswith("No datasets on")
+
+
+def test_counts_are_plural_safe(make_dock):
+    one, _ = make_dock(FakeServer([_feature("a", "A")]))
+    assert one.status.text().startswith("1 dataset on https://gis.example.org.")
+    many, _ = make_dock()
+    assert many.status.text().startswith("3 datasets on")
+
+
+def test_searching_shows_a_busy_cursor_and_status_then_restores_them(make_dock):
+    dock, server = make_dock()
+    dock.search_edit.setText("roads")
+    dock.search()
+    busy_cursor, status = server.during_search
+    assert busy_cursor and status == "Searching…"
+    assert QApplication.overrideCursor() is None
+    assert "datasets on" in dock.status.text()
+
+
+def test_the_message_bar_reports_results_and_the_status_line_reports_state(
+    make_dock, qgis_iface
+):
+    dock, _ = make_dock(connect=False)
+    bar = qgis_iface.messageBar()
+    bar.clear_messages()
+    _connect(dock, SERVER)
+    (shown,) = bar.get_messages(Qgis.MessageLevel.Success)
+    assert shown.endswith("Connected to https://gis.example.org.")
+    assert "Connected" not in dock.status.text()
+    assert dock.status.text() == (
+        "3 datasets on https://gis.example.org. Editing is enabled."
+    )
+
+
+@pytest.mark.parametrize(
+    "raw, plain",
+    [
+        ("GeoLens request failed (HTTP 401): Not authenticated", "refused"),
+        ("GeoLens request failed (HTTP 404)", "couldn't find"),
+        ("GeoLens request failed (HTTP 429)", "busy"),
+        ("GeoLens request failed (HTTP 503): upstream", "ran into a problem"),
+        ("Could not reach GeoLens: [Errno 111] refused", "Couldn't reach"),
+        ("GeoLens items response contained no features", "couldn't read"),
+    ],
+)
+def test_raw_failures_become_plain_language_and_the_detail_goes_to_the_log(
+    make_dock, qgis_iface, monkeypatch, raw, plain
+):
+    dock, _ = make_dock(connect=False)
+    bar = qgis_iface.messageBar()
+    bar.clear_messages()
+    logged = []
+    monkeypatch.setattr(
+        geolens_dock.QgsMessageLog,
+        "logMessage",
+        lambda message, tag, level: logged.append((message, tag)),
+    )
+    dock._message(raw, Qgis.MessageLevel.Critical)
+    (shown,) = bar.get_messages(Qgis.MessageLevel.Critical)
+    assert plain in shown
+    assert "HTTP" not in shown and "Errno" not in shown
+    assert (raw, "GeoLens") in logged
+
+
+def test_a_message_that_is_already_plain_is_shown_unchanged():
+    text = "The selected authentication configuration no longer exists."
+    assert plain_error(text) == text
+
+
+def test_a_failed_add_reports_plainly_through_the_message_bar(make_dock, qgis_iface):
+    dock, server = make_dock()
+    dock.results.setCurrentItem(_row(dock, "Roads"))
+    qgis_iface.messageBar().clear_messages()
+    dock.add_tiles()
+    (shown,) = qgis_iface.messageBar().get_messages(Qgis.MessageLevel.Critical)
+    assert "couldn't find" in shown and "HTTP" not in shown
+
+
+def test_double_click_adds_the_dataset_as_tiles(make_dock):
+    dock, server = make_dock()
+    item = _row(dock, "Elevation")
+    rect = dock.results.visualItemRect(item)
+    QTest.mouseClick(
+        dock.results.viewport(), Qt.MouseButton.LeftButton, pos=rect.center()
+    )
+    QTest.mouseDClick(
+        dock.results.viewport(), Qt.MouseButton.LeftButton, pos=rect.center()
+    )
+    assert [layer.name() for layer in QgsProject.instance().mapLayers().values()] == [
+        "Elevation"
+    ]
+    assert ("gis.example.org", "/api/tiles/token/dem/", KEY) in server.seen
+
+
+def test_enter_adds_the_current_dataset(make_dock):
+    dock, _ = make_dock()
+    dock.results.setCurrentItem(_row(dock, "Elevation"))
+    dock.results.setFocus()
+    QTest.keyClick(dock.results, Qt.Key.Key_Return)
+    assert len(QgsProject.instance().mapLayers()) == 1
+
+
+def test_enter_with_nothing_connected_adds_nothing(make_dock):
+    dock, _ = make_dock(connect=False)
+    QTest.keyClick(dock.results, Qt.Key.Key_Return)
+    assert not QgsProject.instance().mapLayers()
+
+
+def test_the_extent_option_is_a_checkbox_that_is_on_by_default_and_remembered(
+    make_dock, qgis_iface
+):
+    dock, _ = make_dock(connect=False)
+    assert isinstance(dock.view_only, QCheckBox) and dock.view_only.isChecked()
+    assert dock.view_only.text() == "Only features in the current map extent"
+    dock.view_only.setChecked(False)
+    again = GeoLensDock(qgis_iface)
+    try:
+        assert not again.view_only.isChecked()
+    finally:
+        again.cleanup()
+
+
+def _hover(dock, title, monkeypatch=None):
+    viewport = dock.results.viewport()
+    pos = dock.results.visualItemRect(_row(dock, title)).center()
+    event = QHelpEvent(QEvent.Type.ToolTip, pos, viewport.mapToGlobal(pos))
+    QApplication.sendEvent(viewport, event)
+
+
+def test_hovering_a_row_fetches_its_thumbnail_once_from_the_connected_server(
+    make_dock,
+):
+    dock, server = make_dock()
+    assert server.thumbnail_requests() == []
+    _hover(dock, "Roads")
+    _hover(dock, "Roads")
+    assert _fetched(dock, dock.datasets["roads"]) is not None
+    _hover(dock, "Roads")
+    assert server.thumbnail_requests() == [
+        ("gis.example.org", "/api/datasets/roads/quicklook", KEY)
+    ]
+
+
+def test_a_slow_preview_never_blocks_the_hover_or_runs_on_the_gui_thread(make_dock):
+    dock, server = make_dock()
+    server.gate = threading.Event()
+    try:
+        _hover(dock, "Roads")
+        # The fetch is still held up, yet the hover has already returned.
+        assert dock._pending and not dock._thumbnails
+    finally:
+        server.gate.set()
+    assert _fetched(dock, dock.datasets["roads"]) is not None
+    assert server.quicklook_threads
+    assert threading.get_ident() not in server.quicklook_threads
+
+
+def test_the_preview_appears_in_the_tooltip_when_it_arrives(make_dock, monkeypatch):
+    dock, server = make_dock()
+    shown = []
+    monkeypatch.setattr(
+        geolens_dock.QToolTip,
+        "showText",
+        lambda pos, text, widget=None: shown.append(text),
+    )
+    monkeypatch.setattr(dock, "_hovered_dataset_id", lambda: "roads")
+    _hover(dock, "Roads")
+    assert "<img" not in shown[0]
+    _fetched(dock, dock.datasets["roads"])
+    assert "<img" in shown[-1]
+
+
+def test_the_preview_is_not_shown_once_the_pointer_has_moved_on(make_dock, monkeypatch):
+    dock, _ = make_dock()
+    shown = []
+    monkeypatch.setattr(
+        geolens_dock.QToolTip,
+        "showText",
+        lambda pos, text, widget=None: shown.append(text),
+    )
+    monkeypatch.setattr(dock, "_hovered_dataset_id", lambda: "parcels")
+    _hover(dock, "Roads")
+    _fetched(dock, dock.datasets["roads"])
+    assert len(shown) == 1 and "<img" not in shown[0]
+    assert dock._thumbnail(dock.datasets["roads"]) is not None
+
+
+def test_a_dataset_without_a_preview_costs_no_request(make_dock):
+    dock, server = make_dock()
+    assert _fetched(dock, dock.datasets["parcels"]) is None
+    assert server.thumbnail_requests() == []
+
+
+def test_a_failed_preview_is_not_cached_so_a_later_hover_retries(make_dock):
+    dock, server = make_dock()
+    # The fake has no quicklook for the raster, so the server answers 404.
+    assert _fetched(dock, dock.datasets["dem"]) is None
+    assert not dock._pending and not dock._thumbnails
+    assert _fetched(dock, dock.datasets["dem"]) is None
+    assert len(server.thumbnail_requests()) == 2
+
+
+def test_the_thumbnail_is_not_shared_between_servers(make_dock):
+    dock, server = make_dock()
+    _fetched(dock, dock.datasets["roads"])
+    dock.client.base_url = "https://other.example.org"
+    _fetched(dock, dock.datasets["roads"])
+    assert len(server.thumbnail_requests()) == 2
+
+
+def test_reconnecting_refetches_previews_under_the_new_credentials(make_dock):
+    dock, server = make_dock()
+    assert _fetched(dock, dock.datasets["roads"]) is not None
+    other = "glk_other_key_cccccccccccccccc"  # pragma: allowlist secret
+    _connect(dock, SERVER, other)
+    assert not dock._thumbnails
+    assert _fetched(dock, dock.datasets["roads"]) is not None
+    assert [seen[2] for seen in server.thumbnail_requests()] == [
+        KEY,
+        other,
+    ]
+
+
+def test_a_preview_from_the_old_client_cannot_fill_the_new_cache(make_dock):
+    dock, server = make_dock()
+    server.gate = threading.Event()
+    _hover(dock, "Roads")
+    old = dict(dock._pending)
+    _connect(dock, SERVER)
+    server.gate.set()
+    QTest.qWait(300)
+    assert old and not dock._pending and not dock._thumbnails
+
+
+def test_a_preview_finishing_after_cleanup_touches_nothing(make_dock):
+    dock, server = make_dock()
+    server.gate = threading.Event()
+    _hover(dock, "Roads")
+    dock.cleanup()
+    server.gate.set()
+    QTest.qWait(300)
+    assert not dock._thumbnails and not dock._pending
+
+
+def test_metadata_opens_in_the_desktop_browser(make_dock, monkeypatch):
+    opened = []
+    monkeypatch.setattr(
+        geolens_dock.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toString()),
+    )
+    dock, _ = make_dock()
+    dock.results.setCurrentItem(_row(dock, "Roads"))
+    dock.open_metadata()
+    assert opened == [f"{SERVER}/datasets/roads"]
+
+
+def test_footer_links_open_help_and_the_ways_to_get_a_server(make_dock, monkeypatch):
+    opened = []
+    monkeypatch.setattr(
+        geolens_dock.QDesktopServices,
+        "openUrl",
+        lambda url: opened.append(url.toString()),
+    )
+    dock, _ = make_dock(connect=False)
+    dock.help_button.click()
+    install, pilot = dock.no_server_button.menu().actions()
+    install.trigger()
+    pilot.trigger()
+    assert opened == [
+        geolens_dock.HELP_URL,
+        geolens_dock.INSTALL_URL,
+        geolens_dock.PILOT_URL,
+    ]
+
+
+def test_every_control_has_a_tooltip_and_an_accessible_name(make_dock):
+    dock, _ = make_dock(connect=False)
+    controls = [
+        dock.search_edit,
+        dock.search_button,
+        dock.type_filter,
+        dock.sort_combo,
+        dock.results,
+        dock.limit,
+        dock.view_only,
+        dock.tiles_button,
+        dock.features_button,
+        dock.metadata_button,
+        dock.sync_button,
+        dock.help_button,
+        dock.no_server_button,
+    ]
+    for control in controls:
+        assert control.accessibleName(), control
+        if control is not dock.results:
+            assert control.toolTip(), control
+    assert "this QGIS session" in dock.sync_button.toolTip()
+    assert "Tiles are not limited" in dock.limit.toolTip()
+
+
+def test_the_intro_no_longer_says_self_hosted(make_dock):
+    dock, _ = make_dock(connect=False)
+    labels = [label.text() for label in dock.findChildren(type(dock.status))]
+    assert "Browse and add datasets from a GeoLens server." in labels
+
+
+def test_a_failed_search_leaves_the_list_and_reports_plainly(make_dock, qgis_iface):
+    dock, server = make_dock()
+
+    def refuse(request, timeout=0):
+        raise HTTPError(request.full_url, 503, "Unavailable", {}, BytesIO(b"{}"))
+
+    dock.client._opener = refuse
+    qgis_iface.messageBar().clear_messages()
+    dock.search_edit.setText("x")
+    dock.search()
+    assert dock.results.topLevelItemCount() == 3
+    (shown,) = qgis_iface.messageBar().get_messages(Qgis.MessageLevel.Critical)
+    assert "ran into a problem" in shown
+    assert isinstance(GeoLensError("x"), RuntimeError)
+
+
+def test_the_thumbnail_request_gives_up_after_five_seconds(make_dock):
+    dock, server = make_dock()
+    _fetched(dock, dock.datasets["roads"])
+    assert server.timeouts["/api/datasets/roads/quicklook"] == 5
+    assert server.timeouts["/api/search/datasets/"] == 30
+
+
+def test_the_qgis_transport_gives_up_on_a_server_that_never_answers():
+    import socket
+    import time
+    from urllib.request import Request
+
+    from geolens_qgis.connection import QgisTransport
+
+    with socket.socket() as silent:
+        silent.bind(("127.0.0.1", 0))
+        silent.listen(1)
+        url = f"http://127.0.0.1:{silent.getsockname()[1]}/quicklook"
+        started = time.monotonic()
+        with pytest.raises(OSError):
+            QgisTransport()(Request(url), timeout=0.5)
+        assert time.monotonic() - started < 10

@@ -125,6 +125,9 @@ class Dataset:
     license: str | None = None
     language: str | None = None
     source_organization: str | None = None
+    updated: str | None = None
+    has_quicklook: bool = False
+    quicklook_version: str | None = None
 
     @property
     def is_raster(self) -> bool:
@@ -150,7 +153,14 @@ class GeoLensClient:
     def headers(self) -> dict[str, str]:
         return {"X-Api-Key": self.api_key} if self.api_key else {}
 
-    def _request(self, path_or_url: str, method: str = "GET", body: Any = None) -> Any:
+    def _request(
+        self,
+        path_or_url: str,
+        method: str = "GET",
+        body: Any = None,
+        raw: bool = False,
+        timeout: float = 30,
+    ) -> Any:
         url = (
             path_or_url
             if path_or_url.startswith(("http://", "https://"))
@@ -164,8 +174,10 @@ class GeoLensClient:
             headers["Content-Type"] = "application/json"
         request = Request(url, data=data, headers=headers, method=method)
         try:
-            with self._opener(request, timeout=30) as response:
+            with self._opener(request, timeout=timeout) as response:
                 payload = response.read()
+                if raw:
+                    return payload
                 return json.loads(payload.decode("utf-8")) if payload else None
         except HTTPError as error:
             detail = ""
@@ -350,6 +362,14 @@ class GeoLensClient:
     def delete_feature(self, dataset_id: str, gid: int, table_id: str = "") -> None:
         self._request(_feature_path(dataset_id, gid, table_id), "DELETE")
 
+    def quicklook(self, dataset_id: str, version: str | None = None) -> bytes:
+        """The dataset's 256 pixel preview image; `version` only keys caches."""
+        params = {"size": 256}
+        if version:
+            params["v"] = version
+        path = f"/api/datasets/{quote(dataset_id, safe='')}/quicklook?"
+        return self._request(path + urlencode(params), raw=True, timeout=5)
+
     def metadata_url(self, dataset_id: str) -> str:
         return f"{self.base_url}/datasets/{quote(dataset_id, safe='')}"
 
@@ -382,6 +402,13 @@ def parse_dataset(feature: Any) -> Dataset | None:
         license=props.get("license"),
         language=props.get("language"),
         source_organization=props.get("source_organization"),
+        updated=props.get("updated") if isinstance(props.get("updated"), str) else None,
+        has_quicklook=props.get("has_quicklook") is True,
+        quicklook_version=(
+            props.get("quicklook_version")
+            if isinstance(props.get("quicklook_version"), str)
+            else None
+        ),
     )
 
 

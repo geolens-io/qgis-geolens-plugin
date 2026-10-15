@@ -2,25 +2,49 @@
 
 from __future__ import annotations
 
+import base64
 import contextlib
+import html
 import json
 import os
+import re
 import tempfile
-import webbrowser
 
-from qgis.PyQt.QtCore import Qt, QSettings, QTimer
+from qgis.PyQt.QtCore import (
+    QCoreApplication,
+    QEvent,
+    QEventLoop,
+    QPoint,
+    QRectF,
+    Qt,
+    QSettings,
+    QTimer,
+    QUrl,
+)
+from qgis.PyQt.QtGui import (
+    QCursor,
+    QDesktopServices,
+    QImage,
+    QPainter,
+    QPalette,
+    QTextOption,
+)
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDockWidget,
     QFormLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QSpinBox,
+    QToolTip,
     QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
@@ -28,13 +52,16 @@ from qgis.PyQt.QtWidgets import (
 )
 from qgis.core import (
     Qgis,
+    QgsApplication,
     QgsCoordinateReferenceSystem,
     QgsCoordinateTransform,
     QgsDataSourceUri,
     QgsJsonExporter,
+    QgsMessageLog,
     QgsProject,
     QgsRasterLayer,
     QgsRectangle,
+    QgsTask,
     QgsVectorLayer,
     QgsVectorTileLayer,
 )
@@ -78,6 +105,107 @@ SAMPLE_SERVERS = (
     ("GeoLens demo", "https://demo.getgeolens.com"),
     ("GeoLibre datasets", "https://datasets.geolibre.app"),
 )
+HELP_URL = "https://docs.getgeolens.com/guides/api/qgis/"
+INSTALL_URL = "https://docs.getgeolens.com/guides/quickstart/install/"
+PILOT_URL = "https://getgeolens.com/pilot/"
+SETTING_VIEW_ONLY = "geolens/view_only"
+MAX_THUMBNAIL_BYTES = 1_000_000
+LOG_TAG = "GeoLens"
+
+_HTTP_ERROR = re.compile(r"GeoLens request failed \(HTTP (\d+)\)(?::.*)?", re.DOTALL)
+_UNREACHABLE = re.compile(r"Could not reach GeoLens:.*", re.DOTALL)
+_UNREADABLE = re.compile(r"GeoLens [a-z ]*(?:malformed|returned no|contained no)[^.]*")
+
+
+def _http_failure(code):
+    if code in (401, 403):
+        return tr(
+            "The server refused the request. Check your API key or authentication."
+        )
+    if code == 404:
+        return tr("The server couldn't find that. It may have been removed.")
+    if code == 429:
+        return tr("The server is busy. Try again in a moment.")
+    if code >= 500:
+        return tr("The server ran into a problem. Try again later.")
+    return tr("The server couldn't complete the request.")
+
+
+def plain_error(text):
+    """`text` with transport and HTTP failure details replaced by plain language."""
+    text = _HTTP_ERROR.sub(lambda match: _http_failure(int(match.group(1))), text)
+    text = _UNREACHABLE.sub(
+        tr("Couldn't reach the server. Check the address and your connection."), text
+    )
+    return _UNREADABLE.sub(
+        tr(
+            "The server sent a response GeoLens couldn't read. It may run an "
+            "incompatible version."
+        ),
+        text,
+    )
+
+
+def count_text(count, one, many):
+    """`one` or `many` (translated, with a {count} field) for a count."""
+    return (one if count == 1 else many).format(count=f"{count:,}")
+
+
+def _datasets_text(count):
+    if count == 0:
+        return tr("No datasets")
+    return count_text(count, tr("{count} dataset"), tr("{count} datasets"))
+
+
+def _kind(dataset):
+    """The theme icon file and the plain name for a dataset's type."""
+    if dataset.is_raster:
+        return "/mIconRaster.svg", tr("Raster")
+    if dataset.record_type == "table":
+        return "/mIconTableLayer.svg", tr("Table")
+    geometry = (dataset.geometry_type or "").upper()
+    if "POINT" in geometry:
+        return "/mIconPointLayer.svg", tr("Point layer")
+    if "LINE" in geometry:
+        return "/mIconLineLayer.svg", tr("Line layer")
+    if "POLYGON" in geometry:
+        return "/mIconPolygonLayer.svg", tr("Polygon layer")
+    return "/mIconVectorLayer.svg", tr("Vector layer")
+
+
+def _size_text(dataset):
+    if dataset.is_raster:
+        if not dataset.band_count:
+            return ""
+        return count_text(dataset.band_count, tr("{count} band"), tr("{count} bands"))
+    if dataset.feature_count is None:
+        return ""
+    return count_text(
+        dataset.feature_count, tr("{count} feature"), tr("{count} features")
+    )
+
+
+class _ResultsTree(QTreeWidget):
+    """A tree that shows `placeholder` in the empty viewport."""
+
+    def __init__(self):
+        super().__init__()
+        self.placeholder = ""
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.topLevelItemCount() or not self.placeholder:
+            return
+        painter = QPainter(self.viewport())
+        painter.setPen(self.palette().color(QPalette.ColorRole.PlaceholderText))
+        layout = QTextOption(Qt.AlignmentFlag.AlignCenter)
+        layout.setWrapMode(QTextOption.WrapMode.WordWrap)
+        painter.drawText(
+            QRectF(self.viewport().rect().adjusted(12, 12, -12, -12)),
+            self.placeholder,
+            layout,
+        )
+        painter.end()
 
 
 class GeoLensDock(QDockWidget):
@@ -107,6 +235,12 @@ class GeoLensDock(QDockWidget):
         self._session_keys: dict[str, tuple[str, str]] = {}
         # The connection whose key the API key field holds.
         self._key_owner: SavedConnection | None = None
+        self._loaded: list[Dataset] = []
+        self._query = ""
+        self._thumbnails: dict[tuple, bytes] = {}
+        self._pending: dict[tuple, QgsTask] = {}
+        self._thumbnail_client = None
+        self._hover_pos = QPoint()
         self._build_ui()
         self._restore_settings()
 
@@ -114,7 +248,7 @@ class GeoLensDock(QDockWidget):
         root = QWidget(self)
         layout = QVBoxLayout(root)
         layout.setContentsMargins(8, 8, 8, 8)
-        intro = QLabel("Browse and add datasets from a self-hosted GeoLens server.")
+        intro = QLabel(tr("Browse and add datasets from a GeoLens server."))
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
@@ -182,63 +316,158 @@ class GeoLensDock(QDockWidget):
 
         self.connect_button = QPushButton(tr("Connect"))
         self.connect_button.setToolTip(tr("Connect to the selected GeoLens server"))
-        self.connect_button.clicked.connect(self.connect_server)
+        self.connect_button.clicked.connect(self._connect_clicked)
         box.addWidget(self.connect_button)
         layout.addWidget(self.connection_box)
 
         search_row = QHBoxLayout()
         self.search_edit = QLineEdit()
-        self.search_edit.setPlaceholderText("Search the catalog")
+        self.search_edit.setPlaceholderText(tr("Search the catalog"))
+        self.search_edit.setToolTip(
+            tr("Type words from a dataset's title or description.")
+        )
+        self.search_edit.setAccessibleName(tr("Search the catalog"))
         self.search_edit.returnPressed.connect(self.search)
-        search_button = QPushButton("Search")
-        search_button.clicked.connect(self.search)
+        self.search_button = QPushButton(tr("Search"))
+        self.search_button.setToolTip(tr("Search the connected server's catalog."))
+        self.search_button.setAccessibleName(tr("Search"))
+        self.search_button.clicked.connect(self.search)
         search_row.addWidget(self.search_edit)
-        search_row.addWidget(search_button)
+        search_row.addWidget(self.search_button)
         layout.addLayout(search_row)
 
-        self.results = QTreeWidget()
-        self.results.setHeaderLabels(["Dataset", "Type", "Features"])
+        view_row = QHBoxLayout()
+        self.type_filter = QComboBox()
+        self.type_filter.addItem(tr("All types"), "all")
+        self.type_filter.addItem(tr("Vector"), "vector")
+        self.type_filter.addItem(tr("Raster"), "raster")
+        self.type_filter.setToolTip(tr("Show only vector or only raster datasets."))
+        self.type_filter.setAccessibleName(tr("Filter by type"))
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem(tr("Best match"), "relevance")
+        self.sort_combo.addItem(tr("Title A-Z"), "title")
+        self.sort_combo.addItem(tr("Newest first"), "newest")
+        self.sort_combo.setToolTip(tr("Order the datasets in the list."))
+        self.sort_combo.setAccessibleName(tr("Sort datasets"))
+        self.type_filter.currentIndexChanged.connect(self._populate)
+        self.sort_combo.currentIndexChanged.connect(self._populate)
+        view_row.addWidget(self.type_filter)
+        view_row.addWidget(self.sort_combo)
+        layout.addLayout(view_row)
+
+        self.results = _ResultsTree()
+        self.results.setColumnCount(2)
+        self.results.setHeaderHidden(True)
+        self.results.setRootIsDecorated(False)
+        self.results.setUniformRowHeights(True)
+        self.results.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.results.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        header = self.results.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.results.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.results.setAccessibleName(tr("Datasets"))
+        self.results.setAccessibleDescription(
+            tr("Press Enter on a dataset to add it to the map as tiles.")
+        )
         self.results.itemSelectionChanged.connect(self._update_actions)
         self.iface.currentLayerChanged.connect(self._update_actions)
+        self.results.itemDoubleClicked.connect(self._add_item)
+        self.results.installEventFilter(self)
+        self.results.viewport().installEventFilter(self)
         layout.addWidget(self.results, 1)
 
         options = QFormLayout()
         self.limit = QSpinBox()
         self.limit.setRange(1, 1_000_000)
         self.limit.setValue(10_000)
-        self.view_only = QPushButton("Current map extent: On")
-        self.view_only.setCheckable(True)
-        self.view_only.setChecked(True)
-        self.view_only.toggled.connect(
-            lambda value: self.view_only.setText(
-                f"Current map extent: {'On' if value else 'Off'}"
+        self.limit.setToolTip(
+            tr(
+                "The most features Add features downloads. Tiles are not "
+                "limited by this."
             )
         )
-        options.addRow("Feature limit", self.limit)
+        self.limit.setAccessibleName(tr("Feature limit"))
+        self.view_only = QCheckBox(tr("Only features in the current map extent"))
+        self.view_only.setToolTip(
+            tr("Add features downloads only what is visible on the map canvas.")
+        )
+        self.view_only.setAccessibleName(tr("Only features in the current map extent"))
+        self.view_only.setChecked(QSettings().value(SETTING_VIEW_ONLY, True, bool))
+        self.view_only.toggled.connect(
+            lambda value: QSettings().setValue(SETTING_VIEW_ONLY, value)
+        )
+        options.addRow(tr("Feature limit"), self.limit)
         options.addRow(self.view_only)
         layout.addLayout(options)
 
         first_actions = QHBoxLayout()
-        self.tiles_button = QPushButton("Add tiles")
-        self.features_button = QPushButton("Add features")
-        self.metadata_button = QPushButton("Metadata")
-        self.tiles_button.clicked.connect(self.add_tiles)
-        self.features_button.clicked.connect(self.add_features)
+        self.tiles_button = QPushButton(tr("Add tiles"))
+        self.features_button = QPushButton(tr("Add features"))
+        self.metadata_button = QPushButton(tr("Metadata"))
+        self.tiles_button.setToolTip(
+            tr("Add the selected dataset to the map as a tile layer.")
+        )
+        self.features_button.setToolTip(
+            tr("Download the selected vector dataset's features as an editable layer.")
+        )
+        self.metadata_button.setToolTip(
+            tr("Open the selected dataset's page on the server in your browser.")
+        )
+        for button in (self.tiles_button, self.features_button, self.metadata_button):
+            button.setAccessibleName(button.text())
+        self.tiles_button.clicked.connect(lambda *_: self._add(self.add_tiles))
+        self.features_button.clicked.connect(lambda *_: self._add(self.add_features))
         self.metadata_button.clicked.connect(self.open_metadata)
         first_actions.addWidget(self.tiles_button)
         first_actions.addWidget(self.features_button)
         first_actions.addWidget(self.metadata_button)
         layout.addLayout(first_actions)
 
-        self.sync_button = QPushButton("Sync selected GeoLens layer edits")
+        self.sync_button = QPushButton(tr("Sync selected GeoLens layer edits"))
+        self.sync_button.setToolTip(
+            tr(
+                "Send edits to the selected layer back to GeoLens. Works for "
+                "feature layers added with Add features in this QGIS session."
+            )
+        )
+        self.sync_button.setAccessibleName(tr("Sync selected GeoLens layer edits"))
         self.sync_button.clicked.connect(self.sync_active_layer)
         layout.addWidget(self.sync_button)
-        self.status = QLabel("Not connected")
+        self.status = QLabel()
         self.status.setWordWrap(True)
+        self.status.setAccessibleName(tr("Status"))
         layout.addWidget(self.status)
+
+        footer = QHBoxLayout()
+        self.help_button = QPushButton(tr("Help"))
+        self.help_button.setToolTip(tr("Open the GeoLens documentation."))
+        self.help_button.setAccessibleName(tr("Help"))
+        self.help_button.clicked.connect(lambda *_: self._open_url(HELP_URL))
+        self.no_server_button = QPushButton(tr("No server yet?"))
+        self.no_server_button.setToolTip(
+            tr("Find out how to run your own GeoLens server or join the hosted pilot.")
+        )
+        self.no_server_button.setAccessibleName(tr("No server yet?"))
+        menu = QMenu(self.no_server_button)
+        menu.addAction(tr("Install GeoLens yourself")).triggered.connect(
+            lambda *_: self._open_url(INSTALL_URL)
+        )
+        menu.addAction(tr("Join the hosted pilot")).triggered.connect(
+            lambda *_: self._open_url(PILOT_URL)
+        )
+        self.no_server_button.setMenu(menu)
+        for button in (self.help_button, self.no_server_button):
+            button.setFlat(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+        footer.addWidget(self.help_button)
+        footer.addStretch(1)
+        footer.addWidget(self.no_server_button)
+        layout.addLayout(footer)
         self.setWidget(root)
         self._update_actions()
+        self._populate()
 
     def _restore_settings(self):
         settings = QSettings()
@@ -438,6 +667,8 @@ class GeoLensDock(QDockWidget):
             connected and dataset is not None and not dataset.is_raster
         )
         self.metadata_button.setEnabled(connected and dataset is not None)
+        self.type_filter.setEnabled(connected)
+        self.sort_combo.setEnabled(connected)
         layer = self.iface.activeLayer()
         # Only layers with an in-session baseline can be diffed against the server.
         self.sync_button.setEnabled(
@@ -450,8 +681,67 @@ class GeoLensDock(QDockWidget):
         )
 
     def _message(self, text, level=Qgis.MessageLevel.Info):
+        """Show the result of an action; the status line shows the panel's state."""
+        shown = plain_error(text)
+        if shown != text:
+            QgsMessageLog.logMessage(text, LOG_TAG, Qgis.MessageLevel.Warning)
+        self.iface.messageBar().pushMessage("GeoLens", shown, level=level, duration=6)
+
+    @contextlib.contextmanager
+    def _busy(self, text):
         self.status.setText(text)
-        self.iface.messageBar().pushMessage("GeoLens", text, level=level, duration=6)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        # Repaint the status line; user input stays queued until the call ends.
+        QCoreApplication.processEvents(
+            QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
+        )
+        try:
+            yield
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._refresh_status()
+
+    def _refresh_status(self):
+        if not self.client:
+            self.status.setText(tr("Not connected."))
+            return
+        total = len(self.datasets)
+        shown = self.results.topLevelItemCount()
+        server = origin_label(self.client.base_url)
+        if shown == total:
+            text = tr("{datasets} on {server}.").format(
+                datasets=_datasets_text(total), server=server
+            )
+        else:
+            text = tr("{shown} of {datasets} shown on {server}.").format(
+                shown=f"{shown:,}", datasets=_datasets_text(total), server=server
+            )
+        editing = (
+            tr("Editing is enabled.")
+            if self.editing_enabled
+            else tr("Editing is disabled by this server.")
+        )
+        self.status.setText(f"{text} {editing}")
+
+    def _connect_clicked(self, *_):
+        with self._busy(tr("Connecting…")):
+            self.connect_server()
+
+    def _add(self, action):
+        dataset = self._selected_dataset()
+        if not dataset:
+            return
+        with self._busy(tr("Adding {title}…").format(title=dataset.title)):
+            action()
+
+    def _add_item(self, item, *_):
+        # Tiles suit every dataset type, so a double-click or Enter uses them.
+        if self.client and item.data(0, ROLE_DATASET):
+            self.results.setCurrentItem(item)
+            self._add(self.add_tiles)
+
+    def _open_url(self, url):
+        QDesktopServices.openUrl(QUrl(url))
 
     def connect_server(self):
         saved = self._current_connection()
@@ -504,12 +794,12 @@ class GeoLensDock(QDockWidget):
             self._save_key(key, saved)
         self._show_datasets(datasets)
         self.connection_box.setCollapsed(True)
-        suffix = (
-            " Editing is enabled."
-            if self.editing_enabled
-            else " Editing is disabled by this server."
+        self._message(
+            tr("Connected to {server}.").format(
+                server=origin_label(connection.base_url)
+            ),
+            Qgis.MessageLevel.Success,
         )
-        self._message(f"Connected — {len(datasets)} datasets.{suffix}")
 
     def _disconnect(self):
         """Forget the current connection and the catalog it returned."""
@@ -551,30 +841,191 @@ class GeoLensDock(QDockWidget):
 
     def search(self):
         if not self.client:
-            self.connect_server()
+            self._connect_clicked()
             return
+        query = self.search_edit.text()
         try:
-            datasets = self.client.search(self.search_edit.text(), 50)
-            self._show_datasets(datasets)
-            self.status.setText(f"{len(datasets)} dataset(s)")
+            with self._busy(tr("Searching…")):
+                datasets = self.client.search(query, 50)
+                self._show_datasets(datasets, query)
         except GeoLensError as error:
             self._message(str(error), Qgis.MessageLevel.Critical)
 
-    def _show_datasets(self, datasets):
-        self.results.clear()
+    def _show_datasets(self, datasets, query=""):
+        self._forget_thumbnails_for_other_client()
+        self._loaded = list(datasets)
+        self._query = query.strip()
         self.datasets = {dataset.id: dataset for dataset in datasets}
-        for dataset in datasets:
-            count = (
-                "" if dataset.feature_count is None else f"{dataset.feature_count:,}"
-            )
-            item = QTreeWidgetItem(
-                [dataset.title, "raster" if dataset.is_raster else "vector", count]
-            )
-            item.setData(0, ROLE_DATASET, dataset)
-            item.setToolTip(0, dataset.description)
+        dated = any(dataset.updated for dataset in datasets)
+        newest = self.sort_combo.model().item(self.sort_combo.findData("newest"))
+        newest.setEnabled(dated)
+        if not dated and self.sort_combo.currentData() == "newest":
+            self.sort_combo.setCurrentIndex(0)
+        self._populate()
+
+    def _forget_thumbnails_for_other_client(self):
+        """Drop previews fetched under a client that has since been replaced.
+
+        The same server may answer differently to other credentials.
+        """
+        if self.client is self._thumbnail_client:
+            return
+        self._thumbnail_client = self.client
+        self._thumbnails.clear()
+        pending, self._pending = self._pending, {}
+        for task in pending.values():
+            task.cancel()
+
+    def _populate(self, *_):
+        """Fill the list from the loaded datasets, filtered and sorted here."""
+        keep = self._selected_dataset()
+        kind = self.type_filter.currentData()
+        rows = [
+            dataset
+            for dataset in self._loaded
+            if kind == "all" or dataset.is_raster == (kind == "raster")
+        ]
+        order = self.sort_combo.currentData()
+        if order == "title":
+            rows.sort(key=lambda dataset: dataset.title.casefold())
+        elif order == "newest":
+            rows.sort(key=lambda dataset: dataset.updated or "", reverse=True)
+        self.results.clear()
+        for dataset in rows:
+            item = self._row(dataset)
             self.results.addTopLevelItem(item)
-        self.results.resizeColumnToContents(0)
+            if keep and dataset.id == keep.id:
+                self.results.setCurrentItem(item)
+        self.results.placeholder = self._placeholder()
+        self.results.viewport().update()
+        self._refresh_status()
         self._update_actions()
+
+    def _placeholder(self):
+        if not self.client:
+            return tr("Connect to a GeoLens server to browse its datasets.")
+        if self._loaded:
+            return tr("No datasets match this filter.")
+        if self._query:
+            return tr('No datasets found for "{query}". Try different words.').format(
+                query=self._query
+            )
+        return tr("This server has no datasets you can see yet.")
+
+    def _row(self, dataset):
+        icon, kind = _kind(dataset)
+        size = _size_text(dataset)
+        item = QTreeWidgetItem([dataset.title, size])
+        item.setIcon(0, QgsApplication.getThemeIcon(icon))
+        item.setData(0, ROLE_DATASET, dataset)
+        item.setTextAlignment(
+            1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        item.setForeground(
+            1, self.results.palette().color(QPalette.ColorRole.PlaceholderText)
+        )
+        label = ", ".join(part for part in (dataset.title, kind, size) if part)
+        for column in (0, 1):
+            item.setToolTip(column, self._tooltip(dataset, kind))
+            item.setData(column, Qt.ItemDataRole.AccessibleTextRole, label)
+        return item
+
+    def _tooltip(self, dataset, kind, thumbnail=None):
+        parts = [f"<b>{html.escape(dataset.title)}</b> ({html.escape(kind)})"]
+        if dataset.description and dataset.description != dataset.title:
+            parts.append(html.escape(dataset.description[:300]))
+        if thumbnail:
+            encoded = base64.b64encode(thumbnail).decode("ascii")
+            parts.append(f'<img src="data:image/png;base64,{encoded}">')
+        parts.append(
+            "<i>"
+            + html.escape(tr("Double-click or press Enter to add it as tiles."))
+            + "</i>"
+        )
+        return "<p>" + "</p><p>".join(parts) + "</p>"
+
+    def _thumbnail(self, dataset):
+        """The cached preview image, starting one background fetch when absent."""
+        if not (self.client and dataset.has_quicklook):
+            return None
+        key = (self.client.base_url, dataset.id, dataset.quicklook_version)
+        if key not in self._thumbnails and key not in self._pending:
+            self._fetch_thumbnail(key, dataset, self.client)
+        return self._thumbnails.get(key)
+
+    def _fetch_thumbnail(self, key, dataset, client):
+        # QgsBlockingNetworkRequest belongs on a worker thread, and a slow
+        # server must not freeze the window on hover.
+        def work(task):
+            return client.quicklook(dataset.id, dataset.quicklook_version)
+
+        def finished(exception, data=None):
+            # A fetch started under a replaced client or a closed dock is stale.
+            if self._pending.get(key) is not task:
+                return
+            del self._pending[key]
+            valid = (
+                exception is None
+                and data
+                and len(data) <= MAX_THUMBNAIL_BYTES
+                and not QImage.fromData(data).isNull()
+            )
+            if not valid:
+                if exception is not None:
+                    QgsMessageLog.logMessage(
+                        str(exception), LOG_TAG, Qgis.MessageLevel.Info
+                    )
+                return
+            self._thumbnails[key] = data
+            self._show_thumbnail(key, dataset)
+
+        task = QgsTask.fromFunction(
+            tr("Loading a dataset preview"), work, on_finished=finished
+        )
+        self._pending[key] = task
+        QgsApplication.taskManager().addTask(task)
+
+    def _hovered_dataset_id(self):
+        viewport = self.results.viewport()
+        item = self.results.itemAt(viewport.mapFromGlobal(QCursor.pos()))
+        dataset = item.data(0, ROLE_DATASET) if item else None
+        return dataset.id if dataset else None
+
+    def _show_thumbnail(self, key, dataset):
+        """Show the finished preview if the pointer is still over its row."""
+        if (
+            not self.client
+            or key[0] != self.client.base_url
+            or self._hovered_dataset_id() != dataset.id
+        ):
+            return
+        QToolTip.showText(
+            self._hover_pos,
+            self._tooltip(dataset, _kind(dataset)[1], self._thumbnails[key]),
+            self.results.viewport(),
+        )
+
+    def eventFilter(self, watched, event):
+        kind = event.type()
+        if watched is self.results.viewport() and kind == QEvent.Type.ToolTip:
+            item = self.results.itemAt(event.pos())
+            dataset = item.data(0, ROLE_DATASET) if item else None
+            if dataset:
+                self._hover_pos = event.globalPos()
+                text = self._tooltip(
+                    dataset, _kind(dataset)[1], self._thumbnail(dataset)
+                )
+                QToolTip.showText(event.globalPos(), text, self.results.viewport())
+            else:
+                QToolTip.hideText()
+            return True
+        if watched is self.results and kind == QEvent.Type.KeyPress:
+            if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                item = self.results.currentItem()
+                if item:
+                    self._add_item(item)
+                return True
+        return super().eventFilter(watched, event)
 
     def add_tiles(self):
         dataset = self._selected_dataset()
@@ -765,7 +1216,7 @@ class GeoLensDock(QDockWidget):
     def open_metadata(self):
         dataset = self._selected_dataset()
         if self.client and dataset:
-            webbrowser.open(self.client.metadata_url(dataset.id))
+            self._open_url(self.client.metadata_url(dataset.id))
 
     def sync_active_layer(self):
         layer = self.iface.activeLayer()
@@ -1029,6 +1480,10 @@ class GeoLensDock(QDockWidget):
             with contextlib.suppress(OSError):
                 os.unlink(path)
         self.temp_files.clear()
+        # A preview that finishes later finds nothing pending and does nothing.
+        pending, self._pending = self._pending, {}
+        for task in pending.values():
+            task.cancel()
 
     def closeEvent(self, event):
         # Hiding retains in-memory API keys, baselines, and tile refresh timers.

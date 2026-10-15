@@ -97,6 +97,8 @@ class QgisTransport:
                     "sends X-Api-Key."
                 )
         credential = _carries_credential(network_request)
+        if timeout:
+            network_request.setTransferTimeout(int(timeout * 1000))
         feedback = self._feedback = QgsFeedback()
         method = request.get_method()
         payload = QByteArray(request.data or b"")
