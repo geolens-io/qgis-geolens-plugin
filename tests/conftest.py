@@ -72,12 +72,17 @@ def _install_qgis_stub():
         "QgsBox3D",
         "QgsCoordinateReferenceSystem",
         "QgsCoordinateTransform",
+        "QgsDataCollectionItem",
+        "QgsDataItem",
+        "QgsDataItemProvider",
         "QgsDataSourceUri",
+        "QgsErrorItem",
         "QgsExpression",
         "QgsFeatureRequest",
         "QgsFeedback",
         "QgsJsonExporter",
         "QgsLayerMetadata",
+        "QgsMimeDataUtils",
         "QgsNetworkAccessManager",
         "QgsNetworkReplyContent",
         "QgsProject",
@@ -99,6 +104,7 @@ def _install_qgis_stub():
     gui = types.ModuleType("qgis.gui")
     gui.QgsAuthConfigSelect = _Placeholder
     gui.QgsCollapsibleGroupBox = _Placeholder
+    gui.QgsCustomDropHandler = _Placeholder
     sys.modules["qgis.gui"] = gui
     qgis.gui = gui
 

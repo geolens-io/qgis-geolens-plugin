@@ -40,6 +40,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsCollapsibleGroupBox
 
+from ..browser import ROOT_PATH as BROWSER_ROOT_PATH
 from ..client import (
     Dataset,
     GeoLensError,
@@ -294,6 +295,11 @@ class GeoLensDock(QDockWidget):
         )
         self.connection_combo.blockSignals(False)
         self._connection_chosen()
+        self._refresh_browser()
+
+    def _refresh_browser(self):
+        """List the saved connections again in the QGIS Browser panel."""
+        self.iface.browserModel().refresh(BROWSER_ROOT_PATH)
 
     def _stash_session_key(self):
         """Keep the key typed for the connection being left, for that connection."""
@@ -535,6 +541,7 @@ class GeoLensDock(QDockWidget):
             self._legacy_key = ""
         saved = SavedConnection(saved.name, saved.url, authcfg)
         save_connection(saved)
+        self._refresh_browser()
         # The live client already sends this key.
         if self._connected_to is not None and self._connected_to.name == saved.name:
             self._connected_to = saved
@@ -571,14 +578,17 @@ class GeoLensDock(QDockWidget):
 
     def add_tiles(self):
         dataset = self._selected_dataset()
-        if not self.client or not dataset:
-            return
+        if self.client and dataset:
+            self.add_dataset_tiles(self.client, dataset)
+
+    def add_dataset_tiles(self, client, dataset):
+        """Add `dataset` as a tile layer served, and kept renewed, by `client`."""
         try:
-            source = self.client.tile_source(dataset.id)
+            source = client.tile_source(dataset.id)
             if source.get("kind") == "raster":
-                self._add_raster(dataset, source)
+                self._add_raster(client, dataset, source)
             else:
-                self._add_vector_tiles(dataset, source)
+                self._add_vector_tiles(client, dataset, source)
         except GeoLensError as error:
             self._message(str(error), Qgis.MessageLevel.Critical)
 
@@ -595,32 +605,31 @@ class GeoLensDock(QDockWidget):
             uri.setParam("zmax", str(source["maxzoom"]))
         return bytes(uri.encodedUri()).decode()
 
-    def _tag_layer(self, layer, dataset):
-        layer.setCustomProperty("geolens/server", self.client.base_url)
+    def _tag_layer(self, layer, dataset, client=None):
+        client = client or self.client
+        layer.setCustomProperty("geolens/server", client.base_url)
         layer.setCustomProperty("geolens/dataset_id", dataset.id)
-        layer.setCustomProperty(
-            "geolens/metadata_url", self.client.metadata_url(dataset.id)
-        )
-        apply_layer_info(layer, dataset, self.client)
+        layer.setCustomProperty("geolens/metadata_url", client.metadata_url(dataset.id))
+        apply_layer_info(layer, dataset, client)
 
-    def _add_raster(self, dataset, source):
+    def _add_raster(self, client, dataset, source):
         layer = QgsRasterLayer(self._uri(source), dataset.title, "wms")
         if not layer.isValid():
             raise GeoLensError("QGIS could not create the GeoLens raster tile layer")
-        self._tag_layer(layer, dataset)
+        self._tag_layer(layer, dataset, client=client)
         QgsProject.instance().addMapLayer(layer)
-        self._schedule_refresh(layer, dataset, source, "wms")
+        self._schedule_refresh(layer, dataset, source, "wms", client)
         self._zoom_to(dataset)
         self._message(f"Added raster tiles: {dataset.title}")
 
-    def _add_vector_tiles(self, dataset, source):
+    def _add_vector_tiles(self, client, dataset, source):
         layer = QgsVectorTileLayer(self._uri(source), dataset.title)
         if not layer.isValid():
             raise GeoLensError("QGIS could not create the GeoLens vector tile layer")
-        self._tag_layer(layer, dataset)
+        self._tag_layer(layer, dataset, client=client)
         layer.setCustomProperty("geolens/source_layer", source.get("source_layer", ""))
         QgsProject.instance().addMapLayer(layer)
-        self._schedule_refresh(layer, dataset, source, "vectortile")
+        self._schedule_refresh(layer, dataset, source, "vectortile", client)
         self._zoom_to(dataset)
         self._message(f"Added vector tiles: {dataset.title}")
 
@@ -674,12 +683,15 @@ class GeoLensDock(QDockWidget):
 
     def add_features(self):
         dataset = self._selected_dataset()
-        if not self.client or not dataset:
-            return
+        if self.client and dataset:
+            self.add_dataset_features(self.client, dataset)
+
+    def add_dataset_features(self, client, dataset):
+        """Download `dataset` from `client` as an editable layer with a sync baseline."""
         try:
             bbox = self._current_bbox() if self.view_only.isChecked() else None
-            before = _table_id_probe(self.client, dataset.id)
-            collection = self.client.features(dataset.id, self.limit.value(), bbox)
+            before = _table_id_probe(client, dataset.id)
+            collection = client.features(dataset.id, self.limit.value(), bbox)
             baseline = {}
             unidentified = 0
             for feature in collection["features"]:
@@ -702,7 +714,7 @@ class GeoLensDock(QDockWidget):
             layer = QgsVectorLayer(path, dataset.title, "ogr")
             if not layer.isValid():
                 raise GeoLensError("QGIS could not create the GeoLens feature layer")
-            self._tag_layer(layer, dataset)
+            self._tag_layer(layer, dataset, client=client)
             # Synchronization matches features by integer server ID. A dataset
             # that uses string or UUID identifiers would look entirely new and
             # be duplicated onto the server, so it is loaded read-only instead.
@@ -710,9 +722,7 @@ class GeoLensDock(QDockWidget):
             refusal = ""
             if syncable:
                 self.baselines[layer.id()] = baseline
-                refusal = self._start_sync_baseline(
-                    self.client, layer, dataset.id, before
-                )
+                refusal = self._start_sync_baseline(client, layer, dataset.id, before)
                 syncable = not refusal
             layer.setCustomProperty("geolens/editable", syncable)
             QgsProject.instance().addMapLayer(layer)
