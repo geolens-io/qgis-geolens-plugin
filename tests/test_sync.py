@@ -119,7 +119,7 @@ def loaded(qgis_iface, profile):
     def load(server):
         dock = GeoLensDock(qgis_iface, opener=server)
         docks.append(dock)
-        dock.url_edit.setText("https://gis.example.org")
+        dock.use_server("https://gis.example.org")
         dock.connect_server()
         dock.view_only.setChecked(False)
         dock.results.setCurrentItem(dock.results.topLevelItem(0))
