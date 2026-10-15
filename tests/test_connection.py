@@ -1,7 +1,9 @@
 """Credentials and transport against a real QGIS: auth configs, migration, layers."""
 
 import json
+import socket
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from urllib.error import HTTPError
@@ -54,6 +56,7 @@ class _Server:
 
     def __init__(self):
         self.seen = []
+        self.bodies = []
         self.routes = {}
         recorder = self
 
@@ -64,6 +67,8 @@ class _Server:
             def _answer(self):
                 headers = {name.lower(): value for name, value in self.headers.items()}
                 recorder.seen.append((self.command, self.path, headers))
+                length = int(headers.get("content-length") or 0)
+                recorder.bodies.append(self.rfile.read(length) if length else b"")
                 status, headers, body = recorder.routes.get(
                     urlparse(self.path).path, (404, {}, b'{"detail":"Not here"}')
                 )
@@ -74,7 +79,7 @@ class _Server:
                 self.end_headers()
                 self.wfile.write(body)
 
-            do_GET = do_POST = do_PUT = do_DELETE = _answer
+            do_GET = do_POST = do_PUT = do_PATCH = do_DELETE = _answer
 
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.url = f"http://127.0.0.1:{self.httpd.server_port}"
@@ -128,6 +133,7 @@ _CLIENT_CALLS = {
     "features": lambda client: client.features("d"),
     "create": lambda client: client.create_feature("d", {"type": "Feature"}),
     "update": lambda client: client.update_feature("d", 1, {"type": "Feature"}),
+    "patch": lambda client: client.patch_feature("d", 1, {"properties": {}}),
     "delete": lambda client: client.delete_feature("d", 1),
 }
 
@@ -163,7 +169,7 @@ def test_a_pasted_key_travels_with_the_request(server):
     server.routes["/api/datasets/d/features/"] = _json({"id": 3})
     client = GeoLensConnection(server.url, api_key=TEST_KEY).client
     client.search()
-    assert client.create_feature("d", {"type": "Feature"}) == 3
+    assert client.create_feature("d", {"type": "Feature"}) == (3, "")
     assert server.keys_seen() == [TEST_KEY, TEST_KEY]
     assert server.seen[1][2]["content-type"] == "application/json"
 
@@ -196,6 +202,64 @@ def test_a_redirect_is_refused_rather_than_answered_anonymously(server):
     with pytest.raises(GeoLensError, match="redirected"):
         GeoLensConnection(server.url, api_key=TEST_KEY).client.search()
     assert server.keys_seen() == [TEST_KEY, None]
+
+
+def test_a_patch_goes_through_qgis_networking_with_the_key(server):
+    server.routes["/api/datasets/d/features/7"] = _json({"id": 7})
+    client = GeoLensConnection(server.url, api_key=TEST_KEY).client
+    client.patch_feature("d", 7, {"properties": {"name": "B"}}, "4242")
+    ((method, path, headers),) = server.seen
+    assert (method, path) == ("PATCH", "/api/datasets/d/features/7?table_id=4242")
+    assert headers["x-api-key"] == TEST_KEY
+    assert headers["content-type"] == "application/json"
+    assert json.loads(server.bodies[0]) == {"properties": {"name": "B"}}
+
+
+def test_a_patch_is_not_redirected_and_reports_the_error(server, other_server):
+    server.routes["/api/datasets/d/features/7"] = (
+        307,
+        {"Location": other_server.url + "/landed"},
+        b"",
+    )
+    client = GeoLensConnection(server.url, api_key=TEST_KEY).client
+    with pytest.raises(GeoLensError, match="redirected"):
+        client.patch_feature("d", 7, {"properties": {"name": "B"}})
+    assert other_server.seen == []
+    server.routes["/api/datasets/d/features/7"] = (
+        409,
+        {"Content-Type": "application/json"},
+        b'{"detail": {"code": "dataset_replaced", "message": "Read it again."}}',
+    )
+    with pytest.raises(GeoLensError, match=r"HTTP 409\): Read it again\.$") as caught:
+        client.patch_feature("d", 7, {"properties": {"name": "B"}})
+    assert (caught.value.status, caught.value.code) == (409, "dataset_replaced")
+
+
+@pytest.mark.parametrize("method", ["PATCH", "PUT", "POST", "DELETE"])
+def test_a_write_that_times_out_is_an_error(method):
+    from qgis.core import QgsNetworkAccessManager
+
+    silent = socket.socket()
+    silent.bind(("127.0.0.1", 0))
+    silent.listen()
+    url = "http://127.0.0.1:%d" % silent.getsockname()[1]
+    client = GeoLensConnection(url, api_key=TEST_KEY).client
+    write = {
+        "PATCH": lambda: client.patch_feature("d", 7, {"properties": {}}),
+        "PUT": lambda: client.update_feature("d", 7, {"properties": {}}),
+        "POST": lambda: client.create_feature("d", {"properties": {}}),
+        "DELETE": lambda: client.delete_feature("d", 7),
+    }[method]
+    previous = QgsNetworkAccessManager.timeout()
+    QgsNetworkAccessManager.setTimeout(500)
+    started = time.monotonic()
+    try:
+        with pytest.raises(GeoLensError, match="Could not reach GeoLens"):
+            write()
+    finally:
+        QgsNetworkAccessManager.setTimeout(previous)
+        silent.close()
+    assert time.monotonic() - started < 10
 
 
 def test_a_config_that_sends_no_api_key_is_refused(auth_manager, server):
@@ -394,6 +458,13 @@ class _FakeGeoLens:
                         "properties": {"name": "A"},
                     }
                 ],
+            },
+            "/api/datasets/roads/features/1": {
+                "type": "Feature",
+                "id": 1,
+                "geometry": {"type": "Point", "coordinates": [1, 2]},
+                "properties": {"name": "A"},
+                "table_id": "4242",
             },
         }
         if path not in bodies:
@@ -1036,7 +1107,7 @@ def test_sync_after_reconnecting_to_the_same_server_sends_the_edit(
         dock.connect_server()
         dock.sync_active_layer()
         assert [(method, urlparse(url).path) for method, url in opener.writes] == [
-            ("PUT", "/api/datasets/roads/features/1")
+            ("PATCH", "/api/datasets/roads/features/1")
         ]
     finally:
         dock.cleanup()
