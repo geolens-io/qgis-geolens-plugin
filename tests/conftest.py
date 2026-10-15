@@ -78,6 +78,8 @@ def _install_qgis_stub():
         "QgsFeedback",
         "QgsJsonExporter",
         "QgsLayerMetadata",
+        "QgsNetworkAccessManager",
+        "QgsNetworkReplyContent",
         "QgsProject",
         "QgsRasterLayer",
         "QgsRectangle",

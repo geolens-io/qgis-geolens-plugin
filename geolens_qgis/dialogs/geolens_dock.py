@@ -59,11 +59,10 @@ from ..connection import (
     origin_label,
     store_api_key,
 )
+from ..i18n import tr
 from ..layer_info import apply_layer_info
 
 ROLE_DATASET = Qt.ItemDataRole.UserRole
-# QgsJsonExporter writes six decimal places by default (RFC 7946).
-EXPORT_PRECISION = 6
 SAMPLE_SERVERS = (("GeoLibre datasets", "https://datasets.geolibre.app"),)
 
 
@@ -553,6 +552,7 @@ class GeoLensDock(QDockWidget):
             return
         try:
             bbox = self._current_bbox() if self.view_only.isChecked() else None
+            before = _table_id_probe(self.client, dataset.id)
             collection = self.client.features(dataset.id, self.limit.value(), bbox)
             baseline = {}
             unidentified = 0
@@ -581,15 +581,29 @@ class GeoLensDock(QDockWidget):
             # that uses string or UUID identifiers would look entirely new and
             # be duplicated onto the server, so it is loaded read-only instead.
             syncable = unidentified == 0
-            layer.setCustomProperty("geolens/editable", syncable)
+            refusal = ""
             if syncable:
                 self.baselines[layer.id()] = baseline
+                refusal = self._start_sync_baseline(
+                    self.client, layer, dataset.id, before
+                )
+                syncable = not refusal
+            layer.setCustomProperty("geolens/editable", syncable)
             QgsProject.instance().addMapLayer(layer)
             self._zoom_to(dataset)
             QSettings().setValue("geolens/feature_limit", self.limit.value())
             if syncable:
                 self._message(
                     f"Added {layer.featureCount():,} editable features: {dataset.title}"
+                )
+            elif refusal:
+                self._message(
+                    tr("Added {count} features: {title}. {reason}").format(
+                        count=f"{layer.featureCount():,}",
+                        title=dataset.title,
+                        reason=refusal,
+                    ),
+                    Qgis.MessageLevel.Warning,
                 )
             else:
                 self._message(
@@ -650,7 +664,8 @@ class GeoLensDock(QDockWidget):
                 Qgis.MessageLevel.Warning,
             )
             return
-        if layer.isEditable() and not layer.commitChanges():
+        editing = layer.isEditable()
+        if editing and not layer.commitChanges():
             self._message(
                 "Commit the QGIS layer edits before synchronizing.",
                 Qgis.MessageLevel.Warning,
@@ -658,37 +673,36 @@ class GeoLensDock(QDockWidget):
             return
         current = {}
         creates = []
-        exporter = QgsJsonExporter(layer)
-        exporter.setIncludeGeometry(True)
-        for qfeature in layer.getFeatures():
-            feature = json.loads(exporter.exportFeature(qfeature))
-            gid = feature.get("properties", {}).get("_geolens_gid")
-            cleaned = _clean_feature(feature)
+        for fid, gid, feature in _exported_features(layer):
             if isinstance(gid, int):
-                current[gid] = cleaned
+                current[gid] = feature
             else:
-                creates.append((qfeature.id(), cleaned))
+                creates.append((fid, feature))
         updates = []
         for gid, feature in current.items():
-            previous = baseline.get(gid)
-            if previous is None:
-                updates.append((gid, feature))
-                continue
-            # QgsJsonExporter rounds coordinates, so an untouched server
-            # geometry can differ from its export. Compare at export precision
-            # and keep the server geometry when only attributes changed.
-            same_geometry = _rounded(previous.get("geometry")) == _rounded(
-                feature.get("geometry")
-            )
-            if same_geometry:
-                if previous.get("properties") == feature.get("properties"):
-                    continue
-                feature = {**feature, "geometry": previous.get("geometry")}
-            updates.append((gid, feature))
+            changes = _changes(baseline.get(gid), feature)
+            if changes:
+                updates.append((gid, changes, feature))
         deletes = sorted(set(baseline) - set(current))
         total = len(creates) + len(updates) + len(deletes)
+        # The feature API can't drop a column, and sending nulls would wipe
+        # the column on every feature, so a removed field is only reported.
+        removed = set().union(
+            *(feature["properties"] for feature in baseline.values())
+        ) - set(layer.fields().names())
+        unsynced = (
+            tr(
+                "Removed fields aren't synchronized, and GeoLens keeps their "
+                "values: {fields}."
+            ).format(fields=", ".join(sorted(removed)))
+            if removed
+            else ""
+        )
         if not total:
-            self._message("No local changes to synchronize.")
+            if unsynced:
+                self._message(unsynced, Qgis.MessageLevel.Warning)
+            else:
+                self._message("No local changes to synchronize.")
             return
         if (
             deletes
@@ -700,21 +714,67 @@ class GeoLensDock(QDockWidget):
             != QMessageBox.StandardButton.Yes
         ):
             return
+        table_id = str(layer.customProperty("geolens/table_id", "") or "")
         errors = []
-        for gid, feature in updates:
+        # Creates carry no table id, so they go last, after a guarded write
+        # or a fresh read has shown the table is still the one loaded.
+        confirmed = False
+        for gid, changes, feature in updates:
+            if "geometry" in changes and changes["geometry"] is None:
+                errors.append(
+                    tr(
+                        "Feature {gid} lost its geometry, which GeoLens can't "
+                        "store. Undo that edit or delete the feature."
+                    ).format(gid=gid)
+                )
+                continue
             try:
-                self.client.update_feature(dataset_id, gid, feature)
+                self.client.patch_feature(dataset_id, gid, changes, table_id)
                 baseline[gid] = feature
+                confirmed = True
             except GeoLensError as error:
+                if _dataset_replaced(error):
+                    self._stop_replaced_sync(layer, editing)
+                    return
                 errors.append(str(error))
+        for gid in deletes:
+            try:
+                self.client.delete_feature(dataset_id, gid, table_id)
+                baseline.pop(gid, None)
+                confirmed = True
+            except GeoLensError as error:
+                if _dataset_replaced(error):
+                    self._stop_replaced_sync(layer, editing)
+                    return
+                errors.append(str(error))
+        if creates and table_id and not confirmed:
+            gid = min(baseline) if baseline else None
+            current = _current_table_id(self.client, dataset_id, gid)
+            if current is None:
+                # One message per refused create keeps the failure count right.
+                errors += [
+                    tr(
+                        "GeoLens couldn't confirm that the dataset is still the "
+                        "one this layer was loaded from, so new features weren't "
+                        "sent. Try again, or load the dataset again with Add "
+                        "features."
+                    )
+                ] * len(creates)
+                creates = []
+            elif current != table_id:
+                self._stop_replaced_sync(layer, editing)
+                return
         created = []
         unaddressable = 0
         for fid, feature in creates:
             try:
-                gid = self.client.create_feature(dataset_id, feature)
+                gid, created_in = self.client.create_feature(dataset_id, feature)
             except GeoLensError as error:
                 errors.append(str(error))
                 continue
+            if created_in and table_id and created_in != table_id:
+                self._stop_replaced_sync(layer, editing, created_one=True)
+                return
             if gid is None:
                 # The feature exists on the server but cannot be addressed, so
                 # a second sync would create it again. The baseline is dropped
@@ -740,12 +800,6 @@ class GeoLensDock(QDockWidget):
                     "IDs could not be stored locally. Reload the layer before "
                     "synchronizing again."
                 )
-        for gid in deletes:
-            try:
-                self.client.delete_feature(dataset_id, gid)
-                baseline.pop(gid, None)
-            except GeoLensError as error:
-                errors.append(str(error))
         if unaddressable:
             # Features live on the server that this layer cannot match again.
             self.baselines.pop(layer.id(), None)
@@ -755,8 +809,74 @@ class GeoLensDock(QDockWidget):
                 f"Synchronized {total - len(errors)}/{total}; {len(errors)} failed. {errors[0]}",
                 Qgis.MessageLevel.Warning,
             )
+        elif unsynced:
+            self._message(
+                f"Synchronized {total} change(s) to GeoLens. {unsynced}",
+                Qgis.MessageLevel.Warning,
+            )
         else:
             self._message(f"Synchronized {total} change(s) to GeoLens.")
+
+    def _start_sync_baseline(self, client, layer, dataset_id, before):
+        """Record what later edits are diffed against; return why sync is refused.
+
+        QGIS rewrites some values it loads (a datetime gains milliseconds), so
+        edits are compared with its export of the layer, not the server's JSON.
+        `before` is `_table_id_probe` from just before the load; the table id
+        read now must match it, or the layer's features may come from two
+        tables. An empty id means the server reports none, and writes then go
+        unguarded. Returns "" when sync is enabled.
+        """
+        baseline = {
+            gid: feature
+            for _, gid, feature in _exported_features(layer)
+            if isinstance(gid, int)
+        }
+        self.baselines[layer.id()] = baseline
+        probe_gid, table_before = before
+        gid = min(baseline) if baseline else probe_gid
+        table_after = "" if gid is None else _current_table_id(client, dataset_id, gid)
+        if table_before is None or table_after is None:
+            refusal = tr(
+                "GeoLens couldn't confirm which version of the dataset was "
+                "loaded, so synchronization is disabled for this layer. Add it "
+                "again to edit it."
+            )
+        elif table_before != table_after:
+            refusal = tr(
+                "The dataset was replaced on the server while it was loading, "
+                "so synchronization is disabled for this layer. Add it again "
+                "to edit it."
+            )
+        else:
+            layer.setCustomProperty("geolens/table_id", table_after)
+            return ""
+        self.baselines.pop(layer.id(), None)
+        return refusal
+
+    def _stop_replaced_sync(self, layer, editing, created_one=False):
+        # Feature ids may now name other features, so nothing may be written
+        # from this layer again.
+        self.baselines.pop(layer.id(), None)
+        self._update_actions()
+        if editing:
+            layer.startEditing()
+        if created_one:
+            text = tr(
+                "This dataset was replaced on the GeoLens server after the "
+                "layer was loaded. One new feature was added to the replacement "
+                "before that showed, and nothing more was sent. Load the dataset "
+                "again with Add features, check that feature, and redo your "
+                "other edits there. This layer keeps them for reference."
+            )
+        else:
+            text = tr(
+                "This dataset was replaced on the GeoLens server after the layer "
+                "was loaded, so your edits weren't sent. Load the dataset again "
+                "with Add features and redo your edits there. This layer keeps "
+                "them for reference."
+            )
+        self._message(text, Qgis.MessageLevel.Critical)
 
     def cleanup(self):
         """Stop following the active layer and tile refresh timers, and delete
@@ -790,12 +910,65 @@ def _clean_feature(feature):
     }
 
 
-def _rounded(node, ndigits=EXPORT_PRECISION):
-    """Round every coordinate in a GeoJSON geometry to `ndigits` decimals."""
-    if isinstance(node, float):
-        return round(node, ndigits)
-    if isinstance(node, list):
-        return [_rounded(value, ndigits) for value in node]
-    if isinstance(node, dict):
-        return {key: _rounded(value, ndigits) for key, value in node.items()}
-    return node
+def _exported_features(layer):
+    """Yield each feature's QGIS id, server gid (None when new) and GeoJSON."""
+    exporter = QgsJsonExporter(layer)
+    exporter.setIncludeGeometry(True)
+    for qfeature in layer.getFeatures():
+        feature = json.loads(exporter.exportFeature(qfeature))
+        gid = (feature.get("properties") or {}).get("_geolens_gid")
+        yield qfeature.id(), gid, _clean_feature(feature)
+
+
+def _changes(previous, feature):
+    """The PATCH body that turns `previous` into `feature`; empty when equal."""
+    previous = previous or {}
+    before = previous.get("properties") or {}
+    changes = {}
+    properties = {
+        key: value
+        for key, value in feature["properties"].items()
+        if key not in before or before[key] != value
+    }
+    if properties:
+        changes["properties"] = properties
+    if previous.get("geometry") != feature.get("geometry"):
+        changes["geometry"] = feature.get("geometry")
+    return changes
+
+
+def _table_id_probe(client, dataset_id):
+    """(a gid, the table id) read before a load, to bracket it.
+
+    The gid is None for an empty dataset; the table id is None when it
+    couldn't be read.
+    """
+    try:
+        first = client.features(dataset_id, 1)["features"]
+    except (GeoLensError, ValueError):
+        return None, None
+    if not first:
+        return None, ""
+    props = first[0].get("properties")
+    gid = first[0].get("id", props.get("gid") if isinstance(props, dict) else None)
+    if not isinstance(gid, int) or isinstance(gid, bool):
+        return None, ""
+    return gid, _current_table_id(client, dataset_id, gid)
+
+
+def _current_table_id(client, dataset_id, gid):
+    """The dataset's table id, read through feature `gid`.
+
+    "" when the server reports none; None when there is no gid or the read
+    fails.
+    """
+    if gid is None:
+        return None
+    try:
+        return client.feature_table_id(dataset_id, gid)
+    except (GeoLensError, ValueError):
+        return None
+
+
+def _dataset_replaced(error):
+    return error.status == 409 and error.code == "dataset_replaced"

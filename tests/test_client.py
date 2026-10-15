@@ -263,7 +263,7 @@ class ClientTests(unittest.TestCase):
             "geometry": {"type": "Point", "coordinates": [0, 0]},
             "properties": {"name": "A"},
         }
-        self.assertEqual(client.create_feature("places", feature), 9)
+        self.assertEqual(client.create_feature("places", feature), (9, ""))
         client.update_feature("places", 9, feature)
         client.delete_feature("places", 9)
         self.assertEqual(

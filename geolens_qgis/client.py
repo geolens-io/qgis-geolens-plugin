@@ -13,7 +13,12 @@ from urllib.request import Request, urlopen
 
 
 class GeoLensError(RuntimeError):
-    pass
+    """A failed GeoLens request; `status` and `code` are set for an HTTP error."""
+
+    def __init__(self, message: str, status: int | None = None, code: str = ""):
+        super().__init__(message)
+        self.status = status
+        self.code = code
 
 
 def _plugin_version() -> str:
@@ -169,9 +174,13 @@ class GeoLensClient:
                 detail = payload.get("detail") or payload.get("title") or ""
             except (ValueError, AttributeError, OSError):
                 detail = ""
+            code = ""
+            if isinstance(detail, dict):
+                code = str(detail.get("code") or "")
+                detail = detail.get("message") or ""
             suffix = f": {detail}" if detail else ""
             raise GeoLensError(
-                f"GeoLens request failed (HTTP {error.code}){suffix}"
+                f"GeoLens request failed (HTTP {error.code}){suffix}", error.code, code
             ) from error
         except OSError as error:
             raise GeoLensError(f"Could not reach GeoLens: {error}") from error
@@ -288,12 +297,24 @@ class GeoLensClient:
                 url = ""
         return {**first, "type": "FeatureCollection", "features": output}
 
-    def create_feature(self, dataset_id: str, feature: dict[str, Any]) -> int | None:
+    def create_feature(
+        self, dataset_id: str, feature: dict[str, Any]
+    ) -> tuple[int | None, str]:
+        """Create `feature`; return its gid and the table it went into.
+
+        The gid is None when the server returns no integer id, and the table
+        id is empty when the server reports none.
+        """
         body = self._request(
             f"/api/datasets/{quote(dataset_id, safe='')}/features/", "POST", feature
         )
-        value = (body or {}).get("id", (body or {}).get("gid"))
-        return value if isinstance(value, int) else None
+        body = body if isinstance(body, dict) else {}
+        value = body.get("id", body.get("gid"))
+        table_id = body.get("table_id")
+        return (
+            value if isinstance(value, int) else None,
+            table_id if isinstance(table_id, str) else "",
+        )
 
     def update_feature(
         self, dataset_id: str, gid: int, feature: dict[str, Any]
@@ -302,13 +323,36 @@ class GeoLensClient:
             f"/api/datasets/{quote(dataset_id, safe='')}/features/{gid}", "PUT", feature
         )
 
-    def delete_feature(self, dataset_id: str, gid: int) -> None:
-        self._request(
-            f"/api/datasets/{quote(dataset_id, safe='')}/features/{gid}", "DELETE"
-        )
+    def feature_table_id(self, dataset_id: str, gid: int) -> str:
+        """The id of the table that feature `gid` is read from now.
+
+        Empty on servers that don't report one.
+        """
+        body = self._request(_feature_path(dataset_id, gid))
+        value = body.get("table_id") if isinstance(body, dict) else None
+        return value if isinstance(value, str) else ""
+
+    def patch_feature(
+        self, dataset_id: str, gid: int, changes: dict[str, Any], table_id: str = ""
+    ) -> None:
+        """Write only the `geometry` and `properties` in `changes`.
+
+        Fields left out keep their server values. With `table_id`, the server
+        refuses the write with 409 `dataset_replaced` if the dataset's table
+        was replaced since that id was read.
+        """
+        self._request(_feature_path(dataset_id, gid, table_id), "PATCH", changes)
+
+    def delete_feature(self, dataset_id: str, gid: int, table_id: str = "") -> None:
+        self._request(_feature_path(dataset_id, gid, table_id), "DELETE")
 
     def metadata_url(self, dataset_id: str) -> str:
         return f"{self.base_url}/datasets/{quote(dataset_id, safe='')}"
+
+
+def _feature_path(dataset_id: str, gid: int, table_id: str = "") -> str:
+    path = f"/api/datasets/{quote(dataset_id, safe='')}/features/{gid}"
+    return f"{path}?{urlencode({'table_id': table_id})}" if table_id else path
 
 
 def parse_dataset(feature: Any) -> Dataset | None:

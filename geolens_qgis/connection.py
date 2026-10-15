@@ -14,9 +14,11 @@ from qgis.core import (
     QgsAuthMethodConfig,
     QgsBlockingNetworkRequest,
     QgsFeedback,
+    QgsNetworkAccessManager,
+    QgsNetworkReplyContent,
 )
-from qgis.PyQt.QtCore import QByteArray, QCoreApplication, QUrl
-from qgis.PyQt.QtNetwork import QNetworkRequest
+from qgis.PyQt.QtCore import QByteArray, QCoreApplication, QEventLoop, QUrl
+from qgis.PyQt.QtNetwork import QNetworkReply, QNetworkRequest
 
 from .client import (
     Dataset,
@@ -95,28 +97,37 @@ class QgisTransport:
                     "sends X-Api-Key."
                 )
         credential = _carries_credential(network_request)
-        blocking = QgsBlockingNetworkRequest()
-        if self.upload_progress is not None:
-            blocking.uploadProgress.connect(self.upload_progress)
         feedback = self._feedback = QgsFeedback()
         method = request.get_method()
         payload = QByteArray(request.data or b"")
-        if method == "GET":
-            error = blocking.get(
-                network_request,
-                True,
-                feedback,
-                QgsBlockingNetworkRequest.RequestFlag.EmptyResponseIsValid,
-            )
-        elif method == "POST":
-            error = blocking.post(network_request, payload, True, feedback)
-        elif method == "PUT":
-            error = blocking.put(network_request, payload, feedback)
-        elif method == "DELETE":
-            error = blocking.deleteResource(network_request, feedback)
+        failure = ""
+        if method == "PATCH":
+            reply = self._send_patch(network_request, payload, feedback)
         else:
-            raise ValueError(f"Unsupported HTTP method {method}")
-        reply = blocking.reply()
+            blocking = QgsBlockingNetworkRequest()
+            if self.upload_progress is not None:
+                blocking.uploadProgress.connect(self.upload_progress)
+            if method == "GET":
+                error = blocking.get(
+                    network_request,
+                    True,
+                    feedback,
+                    QgsBlockingNetworkRequest.RequestFlag.EmptyResponseIsValid,
+                )
+            elif method == "POST":
+                error = blocking.post(network_request, payload, True, feedback)
+            elif method == "PUT":
+                error = blocking.put(network_request, payload, feedback)
+            elif method == "DELETE":
+                error = blocking.deleteResource(network_request, feedback)
+            else:
+                raise ValueError(f"Unsupported HTTP method {method}")
+            reply = blocking.reply()
+            if error != QgsBlockingNetworkRequest.ErrorCode.NoError:
+                failure = blocking.errorMessage()
+        # QgsBlockingNetworkRequest reports a timed-out request as NoError.
+        if not failure and reply.error() != QNetworkReply.NetworkError.NoError:
+            failure = reply.errorString()
         # The redirected request went out without the credential, so its
         # answer is what an anonymous caller sees.
         final = urlparse(reply.request().url().toString())
@@ -128,10 +139,46 @@ class QgisTransport:
         body = bytes(reply.content())
         status = reply.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
         if isinstance(status, int) and status >= 400:
-            raise HTTPError(url, status, blocking.errorMessage(), {}, BytesIO(body))
-        if error != QgsBlockingNetworkRequest.ErrorCode.NoError:
-            raise OSError(blocking.errorMessage())
+            raise HTTPError(url, status, failure, {}, BytesIO(body))
+        if failure:
+            raise OSError(failure)
         return _Response(body)
+
+    def _send_patch(
+        self, request: QNetworkRequest, payload: QByteArray, feedback: QgsFeedback
+    ) -> QgsNetworkReplyContent:
+        """Send a PATCH, which QgsBlockingNetworkRequest has no method for.
+
+        A redirect is refused, not followed: the request carries the credential.
+        """
+        request.setAttribute(
+            QNetworkRequest.Attribute.RedirectPolicyAttribute,
+            QNetworkRequest.RedirectPolicy.ManualRedirectPolicy,
+        )
+        reply = QgsNetworkAccessManager.instance().sendCustomRequest(
+            request, b"PATCH", payload
+        )
+        loop = QEventLoop()
+        reply.finished.connect(loop.quit)
+        feedback.canceled.connect(reply.abort)
+        if not reply.isFinished():
+            # Clicks wait, so a second sync can't start inside this one.
+            loop.exec(QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+        content = QgsNetworkReplyContent(reply)
+        content.setContent(reply.readAll())
+        reply.deleteLater()
+        status = content.attribute(QNetworkRequest.Attribute.HttpStatusCodeAttribute)
+        if isinstance(status, int) and 300 <= status < 400:
+            location = bytes(content.rawHeader(b"Location")).decode("latin-1")
+            target = request.url().resolved(QUrl(location)).toString()
+            raise GeoLensError(
+                QCoreApplication.translate(
+                    "GeoLens",
+                    "GeoLens redirected the request to {target}. Update the "
+                    "server URL to match.",
+                ).format(target=origin_label(target))
+            )
+        return content
 
 
 def auth_server_mismatch(authcfg: str, url: str, auth_manager=None) -> str:
