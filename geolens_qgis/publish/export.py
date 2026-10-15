@@ -33,6 +33,9 @@ _GEOTIFF_SUFFIXES = {".tif", ".tiff"}
 # Leaves room for the extension and a uniqueness counter in a 255 byte name.
 _MAX_STEM_BYTES = 200
 _UNSAFE_FILE_CHARS = re.compile(r'[\x00-\x1f\x7f/\\:*?"<>|]')
+# A GeoPackage table must not take the layer's name: a layer called
+# gpkg_contents would collide with the file's own metadata tables.
+_TABLE_NAME = "geolens_table"
 _WINDOWS_DEVICE_NAMES = re.compile(r"(?i)(con|prn|aux|nul|com[1-9¹²³]|lpt[1-9¹²³])")
 
 
@@ -161,9 +164,7 @@ def _classify(layer, selected_only: bool, issues: list[Issue]) -> PlannedLayer |
         )
         return None
     if layer_type == Qgis.LayerType.Vector:
-        if _has_no_features(layer):
-            issues.append(_empty(layer_id, name, "Layer is empty and will be skipped."))
-            return None
+        # The selection answers without reading the provider, which can be slow.
         if selected_only and layer.selectedFeatureCount() == 0:
             issues.append(
                 _empty(
@@ -172,6 +173,9 @@ def _classify(layer, selected_only: bool, issues: list[Issue]) -> PlannedLayer |
                     "No features are selected, so the layer will be skipped.",
                 )
             )
+            return None
+        if _has_no_features(layer):
+            issues.append(_empty(layer_id, name, "Layer is empty and will be skipped."))
             return None
         kind = VECTOR if layer.isSpatial() else TABLE
         if kind == TABLE:
@@ -191,16 +195,7 @@ def _classify(layer, selected_only: bool, issues: list[Issue]) -> PlannedLayer |
         and layer.providerType() not in _SERVICE_RASTER_PROVIDERS
     ):
         if _geotiff_path(layer) is None:
-            issues.append(
-                Issue(
-                    "A030",
-                    "warning",
-                    layer_id,
-                    name,
-                    "This raster format can't be published yet, so it will be "
-                    "skipped. Convert it to a GeoTIFF to publish it.",
-                )
-            )
+            issues.append(_unsupported_raster(layer_id, name))
             return None
         return PlannedLayer(layer, RASTER)
     issues.append(
@@ -213,6 +208,17 @@ def _classify(layer, selected_only: bool, issues: list[Issue]) -> PlannedLayer |
         )
     )
     return None
+
+
+def _unsupported_raster(layer_id: str, name: str) -> Issue:
+    return Issue(
+        "A030",
+        "warning",
+        layer_id,
+        name,
+        "This raster format can't be published yet, so it will be "
+        "skipped. Convert it to a GeoTIFF to publish it.",
+    )
 
 
 def _has_no_features(layer) -> bool:
@@ -275,12 +281,13 @@ class _Job:
     fids: list[int] | None = None
 
 
-def _snapshot(planned: PlannedLayer) -> _Job:
+def _snapshot(planned: PlannedLayer) -> _Job | None:
+    """Copy what the worker needs, or None for a raster that no longer qualifies."""
     layer = planned.layer
     job = _Job(layer.id(), layer.name(), planned.kind)
     if planned.kind == RASTER:
         job.existing_geotiff = _geotiff_path(layer)
-        return job
+        return job if job.existing_geotiff else None
     job.source = QgsVectorLayerFeatureSource(layer)
     job.fields, job.wkb_type, job.crs = layer.fields(), layer.wkbType(), layer.crs()
     if planned.selected_only:
@@ -305,11 +312,7 @@ def _write_vector(job: _Job, path: Path, transform_context, is_canceled) -> None
     elif job.kind == TABLE:
         # The driver would adopt a source field called "fid" as its primary key.
         options.layerOptions = [f"FID={_free_name(job.fields, '_geolens_fid')}"]
-    # A GeoPackage names its table; FlatGeobuf takes the file name. SQLite
-    # keeps the sqlite_ prefix for itself.
-    options.layerName = (
-        f"_{path.stem}" if path.stem.lower().startswith("sqlite_") else path.stem
-    )
+    options.layerName = _TABLE_NAME if job.kind == TABLE else path.stem
     writer = QgsVectorFileWriter.create(
         str(path), job.fields, job.wkb_type, job.crs, transform_context, options
     )
@@ -318,17 +321,34 @@ def _write_vector(job: _Job, path: Path, transform_context, is_canceled) -> None
     request = QgsFeatureRequest()
     if job.fids is not None:
         request.setFilterFids(job.fids)
-    canceled = False
+    written = 0
     for feature in job.source.getFeatures(request):
         if is_canceled():
-            canceled = True
-            break
+            del writer
+            raise ExportError("Export canceled.")
         if not writer.addFeature(feature):
             raise ExportError(f"Could not export {job.name}: {writer.errorMessage()}")
-    # Deleting the writer flushes and closes the file.
+        written += 1
+    flushed = writer.flushBuffer()
+    error = writer.errorMessage()
+    # Deleting the writer closes the file, and QGIS doesn't report how that went.
     del writer
-    if canceled:
-        raise ExportError("Export canceled.")
+    if not flushed:
+        raise ExportError(f"Could not export {job.name}: {error}")
+    if _feature_count(path) != written:
+        raise ExportError(
+            f"Could not export {job.name}: the file was not written fully."
+        )
+
+
+def _feature_count(path: Path) -> int | None:
+    from osgeo import ogr
+
+    try:
+        dataset = ogr.Open(str(path))
+        return dataset.GetLayer(0).GetFeatureCount() if dataset else None
+    except RuntimeError:
+        return None
 
 
 def _geotiff_path(layer) -> Path | None:
@@ -382,7 +402,14 @@ class ExportTask(QgsTask):
             references=list(plan.references), issues=list(plan.issues)
         )
         self.error = ""
-        self._jobs = [_snapshot(planned) for planned in plan.to_export]
+        snapshots = [(planned, _snapshot(planned)) for planned in plan.to_export]
+        self._jobs = [job for _, job in snapshots if job]
+        # The source can change between planning and here.
+        self.result.issues.extend(
+            _unsupported_raster(planned.layer.id(), planned.layer.name())
+            for planned, job in snapshots
+            if job is None
+        )
         self.setDependentLayers([planned.layer for planned in plan.to_export])
 
     def run(self) -> bool:

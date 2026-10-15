@@ -131,6 +131,13 @@ def test_a_table_named_like_a_sqlite_internal_table_still_exports(tmp_path):
     assert feature_count(exported.path) == 3
 
 
+@pytest.mark.parametrize("name", ["gpkg_contents", "gpkg_spatial_ref_sys"])
+def test_a_table_named_like_a_geopackage_metadata_table_still_exports(name, tmp_path):
+    task = run([memory_layer("NoGeometry", name)], tmp_path)
+    (exported,) = task.result.exported
+    assert feature_count(exported.path) == 3
+
+
 def test_a_table_with_a_text_field_named_fid_still_exports(tmp_path):
     layer = QgsVectorLayer("NoGeometry?field=fid:string", "ids", "memory")
     rows = []
@@ -211,6 +218,97 @@ def test_layer_with_no_selection_is_skipped_when_selected_only(tmp_path):
     plan = plan_export([layer], SERVER, [layer.id()])
     assert plan.to_export == []
     assert [issue.code for issue in plan.issues] == ["A031"]
+
+
+def test_the_selection_is_checked_before_the_provider_is_counted(tmp_path):
+    layer = memory_layer("Point", "points")
+
+    def slow_count():
+        raise AssertionError("counted the provider")
+
+    layer.featureCount = slow_count
+    plan = plan_export([layer], SERVER, [layer.id()])
+    assert plan.to_export == []
+    assert [issue.code for issue in plan.issues] == ["A031"]
+
+
+def test_a_raster_that_stops_qualifying_before_the_task_starts_is_skipped(tmp_path):
+    layer = geotiff(tmp_path / "dem.tif")
+    plan = plan_export([layer], SERVER)
+    assert len(plan.to_export) == 1
+    layer.setCrs(QgsCoordinateReferenceSystem("EPSG:3857"))
+    (tmp_path / "out").mkdir()
+    task = ExportTask(plan, tmp_path / "out", QgsCoordinateTransformContext())
+    assert task.run(), task.error
+    assert task.result.exported == []
+    assert [issue.code for issue in task.result.issues] == ["A030"]
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+class _WriterProxy:
+    """Wraps a real writer to make its flush or its writes misbehave."""
+
+    def __init__(self, writer, flushes=True, drop_from=None):
+        self._writer, self._flushes, self._drop_from = writer, flushes, drop_from
+        self._added = 0
+
+    def addFeature(self, feature):
+        self._added += 1
+        if self._drop_from is not None and self._added >= self._drop_from:
+            return True
+        return self._writer.addFeature(feature)
+
+    def flushBuffer(self):
+        self._writer.flushBuffer()
+        return self._flushes
+
+    def __getattr__(self, name):
+        return getattr(self._writer, name)
+
+
+def break_writer(monkeypatch, **options):
+    from geolens_qgis.publish import export
+
+    create = export.QgsVectorFileWriter.create
+    monkeypatch.setattr(
+        export,
+        "QgsVectorFileWriter",
+        type(
+            "Writer",
+            (),
+            {
+                "SaveVectorOptions": export.QgsVectorFileWriter.SaveVectorOptions,
+                "WriterError": export.QgsVectorFileWriter.WriterError,
+                "create": staticmethod(
+                    lambda *args: _WriterProxy(create(*args), **options)
+                ),
+            },
+        ),
+    )
+
+
+def make_task(tmp_path):
+    plan = plan_export([memory_layer("Point", "points")], SERVER)
+    (tmp_path / "out").mkdir()
+    return ExportTask(plan, tmp_path / "out", QgsCoordinateTransformContext())
+
+
+def test_a_failed_flush_fails_the_export_and_leaves_no_file(tmp_path, monkeypatch):
+    break_writer(monkeypatch, flushes=False)
+    task = make_task(tmp_path)
+    assert task.run() is False
+    assert task.result.exported == []
+    assert list((tmp_path / "out").iterdir()) == []
+
+
+def test_a_file_that_closes_short_fails_the_export_and_leaves_no_file(
+    tmp_path, monkeypatch
+):
+    break_writer(monkeypatch, drop_from=2)
+    task = make_task(tmp_path)
+    assert task.run() is False
+    assert "not written fully" in task.error
+    assert list((tmp_path / "out").iterdir()) == []
 
 
 def test_subset_string_limits_the_export(tmp_path):
