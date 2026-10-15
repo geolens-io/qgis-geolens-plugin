@@ -2,6 +2,10 @@
 
 A QGIS plugin for browsing and using datasets from a GeoLens server. It brings the [GeoLens](https://github.com/geolens-io/geolens) catalog workflow from [GeoLibre](https://github.com/opengeos/GeoLibre) into QGIS.
 
+![The GeoLens panel and Browser entries in QGIS, with major Atlantic hurricane tracks from the GeoLens demo over OpenStreetMap](.github/assets/qgis-geolens.png)
+
+*Basemap © OpenStreetMap contributors.*
+
 ## Features
 
 - Keep several saved connections, each with its own server URL and authentication. Add the public GeoLens demo or the GeoLibre datasets server as an anonymous connection from the sample list. Private data uses an API key kept in the QGIS authentication database, or pasted for one session.
@@ -40,8 +44,6 @@ python install.py --plugin-dir /path/to/profile/python/plugins
 3. Search, filter and select a dataset.
 4. Choose **Add tiles** for scalable viewing, or **Add features** for attributes and editing.
 5. For an editable feature layer, commit QGIS edits, select that layer in the Layers panel, and click **Sync selected GeoLens layer edits**.
-
-![](https://github.com/user-attachments/assets/3842764d-6e33-4b2b-8cb5-d56d7db2bfca)
 
 GeoLens writes are per-feature and are not transactional. The plugin reports partial failures and requires confirmation before deleting server features.
 
