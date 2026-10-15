@@ -98,6 +98,7 @@ def _install_qgis_stub():
 
     gui = types.ModuleType("qgis.gui")
     gui.QgsAuthConfigSelect = _Placeholder
+    gui.QgsCollapsibleGroupBox = _Placeholder
     sys.modules["qgis.gui"] = gui
     qgis.gui = gui
 
