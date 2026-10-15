@@ -815,6 +815,9 @@ class GeoLensDock(QDockWidget):
         if key and self.save_key.isChecked():
             self._save_key(key, saved)
         self._show_datasets(datasets)
+        if self.search_edit.text().strip():
+            # The box still holds a query, so the list has to answer it.
+            self.search()
         self.connection_box.setCollapsed(True)
         self._message(
             tr("Connected to {server}.").format(
