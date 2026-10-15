@@ -135,6 +135,13 @@ def loaded(qgis_iface, profile):
     QgsProject.instance().clear()
 
 
+def _shown(dock):
+    """Every message pushed to the QGIS message bar so far."""
+    return " ".join(
+        text for texts in dock.iface.messageBar().messages.values() for text in texts
+    )
+
+
 def _fid(layer, gid):
     return next(
         f.id() for f in layer.getFeatures() if f.attribute("_geolens_gid") == gid
@@ -164,7 +171,7 @@ def test_an_attribute_edit_sends_only_that_field(loaded):
             {"properties": {"name": "B"}},
         )
     ]
-    assert "Synchronized 1 change" in dock.status.text()
+    assert "Synchronized 1 change" in _shown(dock)
 
 
 def test_a_geometry_edit_sends_only_the_geometry(loaded):
@@ -213,7 +220,7 @@ def test_a_replaced_dataset_stops_the_sync_and_keeps_the_edits(loaded):
     assert layer.isEditable()
     names = sorted(str(f.attribute("name")) for f in layer.getFeatures())
     assert names == ["B", "D", "new"]
-    assert "replaced on the GeoLens server" in dock.status.text()
+    assert "replaced on the GeoLens server" in _shown(dock)
 
 
 def test_a_server_without_table_ids_syncs_without_one(loaded):
@@ -230,7 +237,7 @@ def test_a_replaced_dataset_gets_no_new_features(loaded):
     assert server.writes == []
     assert layer.id() not in dock.baselines
     assert layer.isEditable()
-    assert "replaced on the GeoLens server" in dock.status.text()
+    assert "replaced on the GeoLens server" in _shown(dock)
 
 
 def test_creates_wait_until_the_table_can_be_confirmed(loaded):
@@ -239,7 +246,7 @@ def test_creates_wait_until_the_table_can_be_confirmed(loaded):
     dock.sync_active_layer()
     assert server.writes == []
     assert layer.id() in dock.baselines
-    assert "couldn't confirm" in dock.status.text()
+    assert "couldn't confirm" in _shown(dock)
 
 
 def test_a_create_into_a_replacement_stops_the_sync(loaded):
@@ -249,7 +256,7 @@ def test_a_create_into_a_replacement_stops_the_sync(loaded):
     dock.sync_active_layer()
     assert [method for method, *_ in server.writes] == ["POST"]
     assert layer.id() not in dock.baselines
-    assert "One new feature was added" in dock.status.text()
+    assert "One new feature was added" in _shown(dock)
 
 
 @pytest.mark.parametrize(
@@ -268,7 +275,7 @@ def test_a_load_that_cant_be_pinned_to_one_table_is_not_syncable(
     assert layer.id() not in dock.baselines
     assert layer.customProperty("geolens/editable") is False
     assert not dock.sync_button.isEnabled()
-    assert shown in dock.status.text()
+    assert shown in _shown(dock)
 
 
 @pytest.mark.parametrize("edit", [False, True], ids=["field-only", "with-an-edit"])
@@ -280,4 +287,4 @@ def test_a_removed_field_is_reported_not_cleared(loaded, edit):
     dock.sync_active_layer()
     expected = [{"properties": {"name": "B"}}] if edit else []
     assert [body for *_, body in server.writes] == expected
-    assert "keeps their values: score." in dock.status.text()
+    assert "keeps their values: score." in _shown(dock)

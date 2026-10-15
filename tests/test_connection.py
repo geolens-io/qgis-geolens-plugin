@@ -1410,7 +1410,9 @@ def test_a_legacy_key_without_a_server_is_not_filled_in(
     try:
         dock.use_server("https://gis.example.org")
         assert dock.key_edit.text() == ""
-        assert "doesn't record which server" in dock.status.text()
+        assert "doesn't record which server" in (
+            qgis_iface.messageBar().get_messages(Qgis.MessageLevel.Warning)[-1]
+        )
         assert QSettings().value(LEGACY_KEY_SETTING) == TEST_KEY
     finally:
         dock.cleanup()
@@ -1431,8 +1433,8 @@ def _not_geolens(request, timeout=0):
 @pytest.mark.parametrize(
     "url, opener, unusable_auth, shown",
     [
-        ("https://gis.example.org", _raise_http_error, False, "401"),
-        ("https://gis.example.org", _raise_network_error, False, "connection refused"),
+        ("https://gis.example.org", _raise_http_error, False, "refused the request"),
+        ("https://gis.example.org", _raise_network_error, False, "reach the server"),
         ("https://gis.example.org", _not_geolens, False, "GeoLens"),
         ("", None, False, "HTTP(S) server URL"),
         # Local server, real QGIS transport: the config sends no X-Api-Key.
@@ -1470,7 +1472,11 @@ def test_a_failed_connect_clears_the_previous_catalog(
         dock._opener = opener
         _add_connection(dock, "second", server.url if url is None else url, authcfg)
         dock.connect_server()
-        assert shown in dock.status.text()
+        assert (
+            shown
+            in qgis_iface.messageBar().get_messages(Qgis.MessageLevel.Critical)[-1]
+        )
+        assert dock.status.text() == "Not connected."
         assert server.seen == []
         assert dock.results.topLevelItemCount() == 0
         assert dock.datasets == {}

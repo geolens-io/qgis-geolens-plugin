@@ -85,6 +85,7 @@ def _install_qgis_stub():
         "QgsMimeDataUtils",
         "QgsNetworkAccessManager",
         "QgsNetworkReplyContent",
+        "QgsMessageLog",
         "QgsProject",
         "QgsRasterLayer",
         "QgsRectangle",
