@@ -445,6 +445,30 @@ def test_no_key_in_any_layer_uri_saved_project_or_setting(
         QgsProject.instance().clear()
 
 
+def test_selecting_an_edited_layer_enables_sync(qgis_iface, clean_profile_settings):
+    from qgis.core import QgsProject
+
+    from geolens_qgis.dialogs import GeoLensDock
+
+    dock = GeoLensDock(qgis_iface, opener=_FakeGeoLens())
+    try:
+        dock.url_edit.setText("https://gis.example.org")
+        dock.key_edit.setText(TEST_KEY)
+        dock.connect_server()
+        dock.view_only.setChecked(False)
+        _select(dock, "Roads")
+        dock.add_features()
+        (layer,) = QgsProject.instance().mapLayers().values()
+        assert not dock.sync_button.isEnabled()
+        qgis_iface.setActiveLayer(layer)
+        # QGIS emits this with the layer; pytest-qgis declares a canvas argument.
+        qgis_iface.currentLayerChanged.emit(qgis_iface.mapCanvas())
+        assert dock.sync_button.isEnabled()
+    finally:
+        dock.cleanup()
+        QgsProject.instance().clear()
+
+
 def test_opening_the_dock_migrates_a_saved_key(
     qgis_iface, auth_manager, clean_profile_settings
 ):

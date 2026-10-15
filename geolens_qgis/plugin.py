@@ -67,9 +67,11 @@ class GeoLensPlugin:
 
             self.dock = GeoLensDock(self.iface)
             self.iface.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.dock)
-        self.dock.setVisible(not self.dock.isVisible())
-        if self.dock.isVisible():
-            self.dock.raise_()
+        elif self.dock.isVisible():
+            self.dock.hide()
+            return
+        self.dock.show()
+        self.dock.raise_()
 
     def show_about(self):
         QMessageBox.about(
