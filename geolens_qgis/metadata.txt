@@ -5,11 +5,11 @@ qgisMaximumVersion=4.99
 description=Browse, visualize, and edit datasets hosted by a GeoLens server.
 about=Connect to public or private GeoLens catalogs. Search datasets, open metadata, add signed vector tiles, add raster XYZ tiles, or load OGC API Features as editable QGIS layers. Edited feature layers can be synchronized back to GeoLens when server-side editing is enabled.
 version=0.2.0
-author=Qiusheng Wu
-email=giswqs@gmail.com
+author=Qiusheng Wu, Ian Shiland
+email=support@getgeolens.com
 repository=https://github.com/geolens-io/qgis-geolens-plugin
 tracker=https://github.com/geolens-io/qgis-geolens-plugin/issues
-homepage=https://github.com/geolens-io/qgis-geolens-plugin
+homepage=https://docs.getgeolens.com/guides/api/qgis/
 category=Web
 icon=icons/icon.svg
 tags=geolens,catalog,ogc api features,vector tiles,raster tiles,postgis
@@ -19,6 +19,19 @@ hasProcessingProvider=no
 supportsQt6=True
 
 changelog=
+    0.2.0 - Saved connections, a clearer panel and safer sync. The project now lives at github.com/geolens-io/qgis-geolens-plugin
+        - Requires QGIS 3.44 or later
+        - Keep several saved GeoLens connections, each with its own server and authentication, with a preset for the public GeoLens demo
+        - GeoLens connections and datasets appear in the Browser panel and can be dragged onto the map
+        - The dataset list shows layer icons, feature or band counts and quicklook previews, and can be filtered and sorted
+        - Added layers carry the dataset's title, description, keywords, licence and link in their layer metadata
+        - Sync sends only the fields you changed, so it no longer overwrites other people's edits, and it stops if the dataset was re-imported
+        - API keys are stored in the QGIS authentication database. A key that 0.1.0 saved in plain text moves there when the panel opens, so QGIS may ask for your master password once
+        - A saved key is sent only to the server it was saved for, and edits sync only to the server the layer came from
+        - Vector tile URLs are fixed, and raster tile links renew before they expire
+        - Requests go through QGIS networking, so servers behind bot filters no longer reject them
+        - The panel opens on the first click, and Sync follows the layer selected in the Layers panel
+        - New icons and an About dialog, with Spanish, French, German and Chinese translations
     0.1.0 - Initial experimental release
         - Browse and search GeoLens catalogs
         - Add vector tiles, raster tiles, and editable OGC API Features layers
