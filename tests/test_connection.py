@@ -17,6 +17,7 @@ pytest.importorskip("pytest_qgis")
 from qgis.core import Qgis, QgsApplication, QgsAuthMethodConfig  # noqa: E402
 from qgis.PyQt.QtCore import QSettings  # noqa: E402
 
+from dock_tasks import settle  # noqa: E402
 from geolens_qgis.client import GeoLensError  # noqa: E402
 from geolens_qgis.connection import (  # noqa: E402
     AUTHCFG_SETTING,
@@ -510,13 +511,17 @@ def test_no_key_in_any_layer_uri_saved_project_or_setting(
         dock.use_server("https://gis.example.org")
         dock.key_edit.setText(TEST_KEY)
         dock.connect_server()
+        settle(dock)
         assert dock.client is not None and dock.editing_enabled
         dock.view_only.setChecked(False)
         _select(dock, "Roads")
         dock.add_tiles()
+        settle(dock)
         dock.add_features()
+        settle(dock)
         _select(dock, "dem")
         dock.add_tiles()
+        settle(dock)
         layers = list(QgsProject.instance().mapLayers().values())
         assert len(layers) == 3
         for layer in layers:
@@ -543,9 +548,11 @@ def test_selecting_an_edited_layer_enables_sync(qgis_iface, clean_profile_settin
         dock.use_server("https://gis.example.org")
         dock.key_edit.setText(TEST_KEY)
         dock.connect_server()
+        settle(dock)
         dock.view_only.setChecked(False)
         _select(dock, "Roads")
         dock.add_features()
+        settle(dock)
         (layer,) = QgsProject.instance().mapLayers().values()
         assert not dock.sync_button.isEnabled()
         qgis_iface.setActiveLayer(layer)
@@ -698,6 +705,7 @@ def test_saving_a_pasted_key_stores_it_only_in_the_auth_database(
         dock.key_edit.setText(TEST_KEY)
         dock.save_key.setChecked(True)
         dock.connect_server()
+        settle(dock)
         profile = QSettings()
         (saved,) = saved_connections()
         loaded, config = auth_manager.loadAuthenticationConfig(
@@ -755,6 +763,7 @@ def test_connecting_with_a_config_saved_for_another_server_sends_nothing(
     try:
         _add_connection(dock, "here", server.url, authcfg)
         dock.connect_server()
+        settle(dock)
         assert server.seen == [] and other_server.seen == []
         assert dock.client is None
         assert f"won't send it to {server.url}" in messages[-1]
@@ -892,6 +901,7 @@ def test_connecting_with_a_config_saved_for_this_server_sends_it(
     try:
         _add_connection(dock, "here", server.url, authcfg)
         dock.connect_server()
+        settle(dock)
         assert dock.client is not None
         assert set(server.keys_seen()) == {TEST_KEY}
         assert dock.connection_box.isCollapsed()
@@ -919,22 +929,28 @@ def test_switching_connections_sends_each_server_only_its_own_credentials(
         save_connection(SavedConnection("there, anonymous", other_server.url, ""))
         dock._refresh_connections("here")
         dock.connect_server()
+        settle(dock)
         _choose(dock, "there")
         dock.connect_server()
+        settle(dock)
         _choose(dock, "here")
         dock.connect_server()
+        settle(dock)
         assert set(server.keys_seen()) == {TEST_KEY}
         assert set(other_server.keys_seen()) == {other_key}
         # A key pasted for this session belongs to its connection.
         _choose(dock, "there, anonymous")
         QTest.keyClicks(dock.key_edit, session_key)
         dock.connect_server()
+        settle(dock)
         assert other_server.keys_seen()[-1] == session_key
         _choose(dock, "here")
         assert dock.key_edit.text() == ""
         dock.connect_server()
+        settle(dock)
         _choose(dock, "there")
         dock.connect_server()
+        settle(dock)
         assert set(server.keys_seen()) == {TEST_KEY}
         assert other_server.keys_seen()[-1] == other_key
         _choose(dock, "there, anonymous")
@@ -958,6 +974,7 @@ def test_a_key_is_not_sent_after_its_connection_moves_to_another_server(
         # Edited by something other than this panel, such as a second dock.
         save_connection(SavedConnection("gis", server.url, ""))
         dock.connect_server()
+        settle(dock)
         assert server.seen == [] and other_server.seen == []
         assert dock.client is None and dock.key_edit.text() == ""
         assert "won't send it to" in messages[-1] and TEST_KEY not in messages[-1]
@@ -1000,6 +1017,7 @@ def test_editing_a_connection_to_another_server_drops_its_credentials(
         assert current_connection_name() == "moved"
         assert dock.key_edit.text() == ""
         dock.connect_server()
+        settle(dock)
         assert dock.client is not None
         assert set(other_server.keys_seen()) == {None} and server.seen == []
     finally:
@@ -1022,6 +1040,7 @@ def test_a_new_connection_with_a_pasted_key_connects_with_it(
         assert saved.name == "local" and saved.authcfg
         assert dock.connection_combo.currentData() == "local"
         dock.connect_server()
+        settle(dock)
         assert set(server.keys_seen()) == {TEST_KEY}
         profile = QSettings()
         assert all(
@@ -1096,6 +1115,7 @@ def test_the_demo_preset_connects_anonymously(
         assert dock.connection_combo.currentData() == "GeoLens demo"
         assert dock.key_edit.text() == ""
         dock.connect_server()
+        settle(dock)
         assert dock.client is not None
         assert dock.client.base_url == "https://demo.getgeolens.com"
         assert opener.requests
@@ -1167,6 +1187,7 @@ def test_the_demo_preset_sends_no_credential_of_a_saved_demo_connection(
         assert selected == SavedConnection("GeoLens demo", demo_url, "")
         assert dock.key_edit.text() == ""
         dock.connect_server()
+        settle(dock)
         assert dock.client is not None and opener.requests
         assert all("x-api-key" not in headers for _, headers in opener.requests)
         assert SavedConnection("Demo with my key", demo_url, authcfg) in (
@@ -1187,6 +1208,7 @@ def test_choosing_another_connection_disconnects_from_the_first(
         save_connection(SavedConnection("b", "https://b.example.org", ""))
         first = dock.use_server("https://a.example.org")
         dock.connect_server()
+        settle(dock)
         _select(dock, "Roads")
         assert dock.tiles_button.isEnabled()
         # Choosing the connected server again keeps the session.
@@ -1206,6 +1228,7 @@ def test_choosing_another_connection_disconnects_from_the_first(
             assert not button.isEnabled()
         seen = len(opener.requests)
         dock.search()
+        settle(dock)
         assert opener.requests[seen:]
         assert all(
             urlparse(url).hostname == "b.example.org"
@@ -1229,11 +1252,13 @@ def test_choosing_a_preset_ends_a_session_with_a_pasted_key(
         dock.samples.setCurrentIndex(demo)
         QTest.keyClicks(dock.key_edit, TEST_KEY)
         dock.connect_server()
+        settle(dock)
         assert opener.requests[-1][1].get("x-api-key") == TEST_KEY
         dock.samples.setCurrentIndex(demo)
         assert dock.client is None and dock.key_edit.text() == ""
         seen = len(opener.requests)
         dock.search()
+        settle(dock)
         assert dock.client is not None and opener.requests[seen:]
         assert all("x-api-key" not in h for _, h in opener.requests[seen:])
         _add_connection(dock, "other", "https://other.example.org")
@@ -1253,6 +1278,7 @@ def test_editing_the_connected_auth_config_disconnects(
     try:
         _add_connection(dock, "gis", "https://gis.example.org", "cfg0001")
         dock.connect_server()
+        settle(dock)
         assert dock.client is not None
         # What Edit saves when only the authentication changes.
         _add_connection(dock, "gis", "https://gis.example.org", edited)
@@ -1273,6 +1299,7 @@ def test_saving_the_pasted_key_keeps_the_session(
         dock.key_edit.setText(TEST_KEY)
         dock.save_key.setChecked(True)
         dock.connect_server()
+        settle(dock)
         (saved,) = saved_connections()
         assert saved.authcfg
         dock._refresh_connections(saved.name)
@@ -1290,10 +1317,12 @@ def test_the_form_collapses_after_connecting_and_opens_on_failure(
     try:
         dock.use_server("https://gis.example.org")
         dock.connect_server()
+        settle(dock)
         assert dock.connection_box.isCollapsed()
         assert "gis.example.org" in dock.connection_box.title()
         dock._opener = _raise_network_error
         dock.connect_server()
+        settle(dock)
         assert not dock.connection_box.isCollapsed()
     finally:
         dock.cleanup()
@@ -1316,6 +1345,7 @@ def test_a_cancelled_migration_keeps_the_key_through_the_session(
         ]
         assert dock.key_edit.text() == TEST_KEY
         dock.connect_server()
+        settle(dock)
         assert dock.client is not None
         assert QSettings().value(LEGACY_KEY_SETTING) == TEST_KEY
     finally:
@@ -1373,6 +1403,7 @@ def test_a_legacy_key_for_another_server_is_not_filled_in(
         ]
         assert dock.connection_combo.currentData() == "other.example.org"
         dock.connect_server()
+        settle(dock)
         assert dock.client is not None
         dock.use_server("https://gis.example.org")
         assert dock.key_edit.text() == TEST_KEY
@@ -1394,6 +1425,7 @@ def test_a_legacy_key_is_never_sent_to_another_server(
         dock.use_server(server.url)
         assert dock.key_edit.text() == ""
         dock.connect_server()
+        settle(dock)
         assert dock.client is not None
         assert set(server.keys_seen()) == {None} and other_server.seen == []
     finally:
@@ -1467,11 +1499,13 @@ def test_a_failed_connect_clears_the_previous_catalog(
     try:
         dock.use_server("https://gis.example.org")
         dock.connect_server()
+        settle(dock)
         _select(dock, "Roads")
         assert dock.tiles_button.isEnabled() and dock.editing_enabled
         dock._opener = opener
         _add_connection(dock, "second", server.url if url is None else url, authcfg)
         dock.connect_server()
+        settle(dock)
         assert (
             shown
             in qgis_iface.messageBar().get_messages(Qgis.MessageLevel.Critical)[-1]
@@ -1506,9 +1540,11 @@ def _load_edited_roads(dock, qgis_iface, server):
     """Load roads from `server`, then change one attribute without committing."""
     dock.use_server(server)
     dock.connect_server()
+    settle(dock)
     dock.view_only.setChecked(False)
     _select(dock, "Roads")
     dock.add_features()
+    settle(dock)
     from qgis.core import QgsProject
 
     (layer,) = QgsProject.instance().mapLayersByName("Roads")
@@ -1535,6 +1571,7 @@ def test_sync_refuses_a_layer_from_another_server(
         layer.setCustomProperty("geolens/server", recorded)
         baseline = json.dumps(dock.baselines[layer.id()], sort_keys=True)
         dock.sync_active_layer()
+        settle(dock)
         assert opener.writes == []
         if recorded:
             assert f"came from {recorded}" in messages[-1]
@@ -1563,6 +1600,7 @@ def test_a_reopened_layer_from_another_server_is_told_to_reload_it(
         layer.setCustomProperty("geolens/server", "https://other.example.org")
         del dock.baselines[layer.id()]
         dock.sync_active_layer()
+        settle(dock)
         assert "no GeoLens edit baseline" in messages[-1]
         assert opener.writes == []
         assert layer.isEditable() and layer.isModified()
@@ -1584,11 +1622,15 @@ def test_sync_after_reconnecting_to_the_same_server_sends_the_edit(
         _load_edited_roads(dock, qgis_iface, "https://gis.example.org")
         dock.use_server("https://other.example.org")
         dock.connect_server()
+        settle(dock)
         dock.sync_active_layer()
+        settle(dock)
         assert opener.writes == []
         dock.use_server("HTTPS://GIS.example.org:443/")
         dock.connect_server()
+        settle(dock)
         dock.sync_active_layer()
+        settle(dock)
         assert [(method, urlparse(url).path) for method, url in opener.writes] == [
             ("PATCH", "/api/datasets/roads/features/1")
         ]

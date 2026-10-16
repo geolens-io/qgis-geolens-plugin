@@ -85,10 +85,12 @@ def build_metadata(dataset, detail, page_url) -> QgsLayerMetadata:
     return metadata
 
 
-def apply_layer_info(layer, dataset, client) -> None:
-    """Set the layer's metadata; a failed detail request leaves the search data."""
+def fetch_detail(client, dataset_id) -> dict:
+    """The dataset's detail record, or {} when the request fails.
+
+    Call it from a background task: it waits for the server.
+    """
     try:
-        detail = client.dataset_detail(dataset.id)
+        return client.dataset_detail(dataset_id)
     except (GeoLensError, ValueError):
-        detail = {}
-    layer.setMetadata(build_metadata(dataset, detail, client.metadata_url(dataset.id)))
+        return {}

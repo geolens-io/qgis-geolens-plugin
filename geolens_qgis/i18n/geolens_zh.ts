@@ -484,6 +484,10 @@
         <translation>已删除的字段不会同步，GeoLens 会保留它们的值：{fields}。</translation>
     </message>
     <message>
+        <source>Renewing tile access: {title}</source>
+        <translation>正在续期瓦片访问：{title}</translation>
+    </message>
+    <message>
         <source>Report an issue</source>
         <translation>报告问题</translation>
     </message>
@@ -586,6 +590,10 @@
     <message>
         <source>Synchronizing will delete {count} server features. Continue?</source>
         <translation>同步将删除服务器上的 {count} 个要素。要继续吗？</translation>
+    </message>
+    <message>
+        <source>Synchronizing {title}…</source>
+        <translation>正在同步 {title}…</translation>
     </message>
     <message>
         <source>Table</source>

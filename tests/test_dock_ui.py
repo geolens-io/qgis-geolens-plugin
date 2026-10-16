@@ -17,6 +17,7 @@ from qgis.PyQt.QtGui import QHelpEvent, QImage  # noqa: E402
 from qgis.PyQt.QtTest import QTest  # noqa: E402
 from qgis.PyQt.QtWidgets import QApplication, QCheckBox  # noqa: E402
 
+from dock_tasks import settle  # noqa: E402
 from geolens_qgis.client import GeoLensError  # noqa: E402
 from geolens_qgis.dialogs import geolens_dock  # noqa: E402
 from geolens_qgis.dialogs.geolens_dock import GeoLensDock, plain_error  # noqa: E402
@@ -73,7 +74,11 @@ DATASETS = [
 
 
 class FakeServer:
-    """An opener that serves `datasets` and records every request it sees."""
+    """An opener that serves `datasets` and records every request it sees.
+
+    A request for a path in `gates`, or for a (path, search text) pair, waits
+    until that event is set.
+    """
 
     def __init__(self, datasets=DATASETS):
         self.datasets = datasets
@@ -82,20 +87,18 @@ class FakeServer:
         self.quicklook_threads = []
         self.gate = None
         self.version_gates = {}
-        self.during_search = None
+        self.gates = {}
 
     def __call__(self, request, timeout=0):
         url = urlparse(request.full_url)
         self.timeouts[url.path] = timeout
         self.seen.append((url.netloc, url.path, request.get_header("X-api-key")))
         path = url.path
+        query = parse_qs(url.query).get("q", [""])[0]
+        gate = self.gates.get(path) or self.gates.get((path, query))
+        if gate is not None:
+            gate.wait(10)
         if path == "/api/search/datasets/":
-            query = parse_qs(url.query).get("q", [""])[0]
-            if query:
-                self.during_search = (
-                    QApplication.overrideCursor() is not None,
-                    self.dock.status.text(),
-                )
             features = [] if query == "nothing" else self.datasets
             return BytesIO(json.dumps({"features": features}).encode())
         if path == "/api/capabilities":
@@ -125,6 +128,7 @@ def _connect(dock, url, key=""):
     dock.use_server(url)
     dock.key_edit.setText(key)
     dock.connect_server()
+    settle(dock)
 
 
 @pytest.fixture(autouse=True)
@@ -268,6 +272,7 @@ def test_a_search_with_no_results_names_the_query(make_dock):
     dock, _ = make_dock()
     dock.search_edit.setText("nothing")
     dock.search()
+    settle(dock)
     assert dock.results.topLevelItemCount() == 0
     assert dock.results.placeholder == (
         'No datasets found for "nothing". Try different words.'
@@ -282,14 +287,21 @@ def test_counts_are_plural_safe(make_dock):
     assert many.status.text().startswith("3 datasets on")
 
 
-def test_searching_shows_a_busy_cursor_and_status_then_restores_them(make_dock):
+def test_a_search_runs_in_the_background_and_the_status_line_says_so(make_dock):
     dock, server = make_dock()
+    server.gates["/api/search/datasets/"] = gate = threading.Event()
     dock.search_edit.setText("roads")
-    dock.search()
-    busy_cursor, status = server.during_search
-    assert busy_cursor and status == "Searching…"
-    assert QApplication.overrideCursor() is None
-    assert "datasets on" in dock.status.text()
+    try:
+        dock.search()
+        # The server hasn't answered, yet the call has returned.
+        assert dock.status.text() == "Searching…"
+        assert not dock.search_button.isEnabled()
+        assert QApplication.overrideCursor() is None
+    finally:
+        gate.set()
+    settle(dock)
+    assert dock.search_button.isEnabled()
+    assert dock.status.text().startswith("3 datasets on")
 
 
 def test_the_message_bar_reports_results_and_the_status_line_reports_state(
@@ -347,6 +359,7 @@ def test_a_failed_add_reports_plainly_through_the_message_bar(make_dock, qgis_if
     dock.results.setCurrentItem(_row(dock, "Roads"))
     qgis_iface.messageBar().clear_messages()
     dock.add_tiles()
+    settle(dock)
     (shown,) = qgis_iface.messageBar().get_messages(Qgis.MessageLevel.Critical)
     assert "couldn't find" in shown and "HTTP" not in shown
 
@@ -361,6 +374,7 @@ def test_double_click_adds_the_dataset_as_tiles(make_dock):
     QTest.mouseDClick(
         dock.results.viewport(), Qt.MouseButton.LeftButton, pos=rect.center()
     )
+    settle(dock)
     assert [layer.name() for layer in QgsProject.instance().mapLayers().values()] == [
         "Elevation"
     ]
@@ -372,6 +386,7 @@ def test_enter_adds_the_current_dataset(make_dock):
     dock.results.setCurrentItem(_row(dock, "Elevation"))
     dock.results.setFocus()
     QTest.keyClick(dock.results, Qt.Key.Key_Return)
+    settle(dock)
     assert len(QgsProject.instance().mapLayers()) == 1
 
 
@@ -590,6 +605,7 @@ def test_a_failed_search_leaves_the_list_and_reports_plainly(make_dock, qgis_ifa
     qgis_iface.messageBar().clear_messages()
     dock.search_edit.setText("x")
     dock.search()
+    settle(dock)
     assert dock.results.topLevelItemCount() == 3
     (shown,) = qgis_iface.messageBar().get_messages(Qgis.MessageLevel.Critical)
     assert "ran into a problem" in shown
@@ -652,6 +668,7 @@ def test_a_preview_for_a_replaced_version_never_shows(make_dock, monkeypatch, v1
     _hover(dock, "Roads")
     server.datasets = _roads(quicklook_version="v2", description="Resurfaced")
     dock.search()
+    settle(dock)
     _hover(dock, "Roads")
     shown.clear()
     first, second = ("abc123", "v2") if v1_first else ("v2", "abc123")
@@ -673,6 +690,7 @@ def test_a_description_only_change_shows_the_new_text(make_dock, monkeypatch):
     _hover(dock, "Roads")
     server.datasets = _roads(description="Brand new words")
     dock.search()
+    settle(dock)
     shown.clear()
     server.version_gates["abc123"].set()
     _wait_idle(dock)
@@ -687,6 +705,7 @@ def test_a_removed_preview_is_not_shown_when_the_fetch_finishes(make_dock, monke
     _hover(dock, "Roads")
     server.datasets = _roads(has_quicklook=False, quicklook_version=None)
     dock.search()
+    settle(dock)
     shown.clear()
     server.version_gates["abc123"].set()
     _wait_idle(dock)
@@ -769,3 +788,172 @@ def test_counts_follow_the_default_locale(make_dock):
     dock, _ = make_dock()
     assert _row(dock, "Roads").text(1) == "1.200 features"
     assert geolens_dock.count_text(1200, "{count} a", "{count} b") == "1.200 b"
+
+
+def _messages(qgis_iface, level=Qgis.MessageLevel.Critical):
+    return qgis_iface.messageBar().get_messages(level)
+
+
+def _reached(server, *paths):
+    """Wait until the server has seen a request for each path."""
+    for _ in range(500):
+        if set(paths) <= {seen[1] for seen in server.seen}:
+            return
+        QTest.qWait(10)
+    raise AssertionError(f"no request for {paths}")
+
+
+def _quiet(qgis_iface):
+    return not any(
+        _messages(qgis_iface, level)
+        for level in (Qgis.MessageLevel.Info, Qgis.MessageLevel.Critical)
+    )
+
+
+def test_a_newer_search_replaces_one_the_server_has_not_answered(make_dock, qgis_iface):
+    dock, server = make_dock()
+    server.gates[("/api/search/datasets/", "slow")] = gate = threading.Event()
+    qgis_iface.messageBar().clear_messages()
+    try:
+        dock.search_edit.setText("slow")
+        server.seen.clear()
+        dock.search()
+        _reached(server, "/api/search/datasets/")
+        dock.search_edit.setText("nothing")
+        dock.search()
+        settle(dock)
+        assert dock._query == "nothing"
+    finally:
+        gate.set()
+    QTest.qWait(300)
+    assert dock._query == "nothing" and dock.results.topLevelItemCount() == 0
+    assert _quiet(qgis_iface)
+
+
+@pytest.mark.parametrize("path", ["/api/search/datasets/", "/api/tiles/token/dem/"])
+def test_a_result_for_a_connection_left_behind_is_dropped(make_dock, qgis_iface, path):
+    dock, server = make_dock()
+    server.gates[path] = gate = threading.Event()
+    dock.results.setCurrentItem(_row(dock, "Elevation"))
+    qgis_iface.messageBar().clear_messages()
+    try:
+        dock.search() if "search" in path else dock.add_tiles()
+        _reached(server, path)
+        dock.use_server("https://other.example.org")
+        assert dock.client is None and not dock._pending
+    finally:
+        gate.set()
+    QTest.qWait(300)
+    assert dock.results.topLevelItemCount() == 0
+    assert not QgsProject.instance().mapLayers()
+    assert _quiet(qgis_iface)
+
+
+def test_a_connect_answered_after_choosing_another_connection_is_dropped(
+    make_dock, qgis_iface
+):
+    dock, server = make_dock(connect=False)
+    server.gates["/api/capabilities"] = gate = threading.Event()
+    dock.use_server(SERVER)
+    qgis_iface.messageBar().clear_messages()
+    try:
+        dock.connect_server()
+        assert not dock.connect_button.isEnabled()
+        _reached(server, "/api/capabilities")
+        dock.use_server("https://other.example.org")
+        assert dock.connect_button.isEnabled()
+    finally:
+        gate.set()
+    QTest.qWait(300)
+    assert dock.client is None and dock.results.topLevelItemCount() == 0
+    assert _messages(qgis_iface, Qgis.MessageLevel.Success) == []
+    assert _quiet(qgis_iface)
+
+
+def test_results_arriving_after_cleanup_touch_nothing(make_dock, qgis_iface):
+    dock, server = make_dock()
+    server.gates["/api/search/datasets/"] = searched = threading.Event()
+    server.gates["/api/tiles/token/dem/"] = added = threading.Event()
+    dock.results.setCurrentItem(_row(dock, "Elevation"))
+    dock.search_edit.setText("nothing")
+    qgis_iface.messageBar().clear_messages()
+    try:
+        dock.search()
+        dock.add_tiles()
+        _reached(server, "/api/search/datasets/", "/api/tiles/token/dem/")
+        dock.cleanup()
+    finally:
+        searched.set()
+        added.set()
+    QTest.qWait(300)
+    assert not dock._pending
+    assert dock.results.topLevelItemCount() == 3
+    assert not QgsProject.instance().mapLayers()
+    assert _quiet(qgis_iface)
+
+
+@pytest.mark.parametrize("title, added", [("Elevation", 1), ("Roads", 0)])
+def test_the_add_buttons_wait_for_the_server_then_come_back(
+    make_dock, qgis_iface, title, added
+):
+    # The fake serves a tile token for the raster only, so Roads fails.
+    dock, server = make_dock()
+    ident = "dem" if added else "roads"
+    server.gates[f"/api/tiles/token/{ident}/"] = gate = threading.Event()
+    dock.results.setCurrentItem(_row(dock, title))
+    qgis_iface.messageBar().clear_messages()
+    try:
+        dock.tiles_button.click()
+        assert dock.status.text() == f"Adding {title}…"
+        assert not dock.tiles_button.isEnabled()
+        assert not dock.features_button.isEnabled()
+        # A double-click waits too, so the dataset isn't added twice.
+        dock._add_item(_row(dock, title))
+    finally:
+        gate.set()
+    settle(dock)
+    assert len(QgsProject.instance().mapLayers()) == added
+    assert dock.tiles_button.isEnabled()
+    assert dock.features_button.isEnabled() == (title == "Roads")
+    assert dock.status.text().startswith("3 datasets on")
+    assert len(_messages(qgis_iface)) == 1 - added
+
+
+def test_the_connect_button_comes_back_after_a_failed_connect(make_dock, qgis_iface):
+    dock, server = make_dock(connect=False)
+    server.gates["/api/search/datasets/"] = gate = threading.Event()
+    server.datasets = None
+    dock.use_server(SERVER)
+    qgis_iface.messageBar().clear_messages()
+    try:
+        dock.connect_button.click()
+        assert dock.status.text() == "Connecting…"
+        assert not dock.connect_button.isEnabled()
+    finally:
+        gate.set()
+    settle(dock)
+    assert dock.connect_button.isEnabled() and dock.client is None
+    assert dock.status.text() == "Not connected."
+    assert len(_messages(qgis_iface)) == 1
+
+
+def test_a_failed_tile_renewal_tries_again_in_a_minute(make_dock):
+    dock, server = make_dock()
+    dock.results.setCurrentItem(_row(dock, "Elevation"))
+    dock.add_tiles()
+    settle(dock)
+    (layer,) = QgsProject.instance().mapLayers().values()
+    source = layer.source()
+    timer = dock.refresh_timers[layer.id()]
+    timer.stop()
+
+    def refuse(request, timeout=0):
+        raise HTTPError(request.full_url, 503, "Unavailable", {}, BytesIO(b"{}"))
+
+    # The layer renews through the client that added it.
+    dock.client._opener = refuse
+    timer.timeout.emit()
+    settle(dock)
+    assert dock.refresh_timers[layer.id()] is timer
+    assert timer.isActive() and timer.interval() == 60_000
+    assert layer.source() == source

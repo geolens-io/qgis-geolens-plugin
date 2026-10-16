@@ -1,6 +1,7 @@
 """Syncing layer edits: partial writes, and refusal after a table replacement."""
 
 import json
+import threading
 from io import BytesIO
 from urllib.error import HTTPError
 from urllib.parse import parse_qs, urlparse
@@ -17,6 +18,8 @@ from qgis.core import (  # noqa: E402
 )
 from qgis.PyQt.QtCore import QSettings  # noqa: E402
 from qgis.PyQt.QtWidgets import QMessageBox  # noqa: E402
+
+from dock_tasks import settle  # noqa: E402
 
 TABLE_ID = "4242"
 FEATURES = [
@@ -39,6 +42,8 @@ class _Server:
 
     Single-feature reads answer with `table_ids` in turn, repeating the last;
     None leaves the id out, as older servers do, and FAIL answers 500.
+    Writes wait for `gate` when it is set, and those using a method in
+    `answers` get that (status, body) reply.
     """
 
     def __init__(
@@ -51,13 +56,22 @@ class _Server:
         self.replaced = replaced
         self.created_in = created_in
         self.writes = []
+        self.gate = None
+        self.answers = {}
 
     def __call__(self, request, timeout=0):
         url = urlparse(request.full_url)
         method = request.get_method()
         if method != "GET":
+            if self.gate is not None:
+                self.gate.wait(10)
             body = json.loads(request.data) if request.data else None
             self.writes.append((method, url.path, parse_qs(url.query), body))
+            if method in self.answers:
+                status, reply = self.answers[method]
+                if status >= 400:
+                    return _error(request, status, reply)
+                return BytesIO(reply)
             if self.replaced and method in ("PATCH", "DELETE"):
                 detail = {"code": "dataset_replaced", "message": "Read it again."}
                 return _error(request, 409, {"detail": detail})
@@ -121,9 +135,11 @@ def loaded(qgis_iface, profile):
         docks.append(dock)
         dock.use_server("https://gis.example.org")
         dock.connect_server()
+        settle(dock)
         dock.view_only.setChecked(False)
         dock.results.setCurrentItem(dock.results.topLevelItem(0))
         dock.add_features()
+        settle(dock)
         (layer,) = QgsProject.instance().mapLayersByName("Roads")
         qgis_iface.setActiveLayer(layer)
         layer.startEditing()
@@ -163,6 +179,7 @@ def test_an_attribute_edit_sends_only_that_field(loaded):
     dock, layer = loaded(server := _Server())
     _rename(layer, 1, "B")
     dock.sync_active_layer()
+    settle(dock)
     assert server.writes == [
         (
             "PATCH",
@@ -178,6 +195,7 @@ def test_a_geometry_edit_sends_only_the_geometry(loaded):
     dock, layer = loaded(server := _Server())
     layer.changeGeometry(_fid(layer, 2), QgsGeometry.fromPointXY(QgsPointXY(5, 6)))
     dock.sync_active_layer()
+    settle(dock)
     assert server.writes == [
         (
             "PATCH",
@@ -188,6 +206,7 @@ def test_a_geometry_edit_sends_only_the_geometry(loaded):
     ]
     # Synced, so the next sync has nothing to send.
     dock.sync_active_layer()
+    settle(dock)
     assert len(server.writes) == 1
 
 
@@ -200,6 +219,7 @@ def test_guarded_writes_carry_the_table_id_and_precede_creates(loaded, monkeypat
     layer.deleteFeature(_fid(layer, 2))
     _add(layer)
     dock.sync_active_layer()
+    settle(dock)
     assert [(method, path, query) for method, path, query, _ in server.writes] == [
         ("PATCH", "/api/datasets/roads/features/1", {"table_id": [TABLE_ID]}),
         ("DELETE", "/api/datasets/roads/features/2", {"table_id": [TABLE_ID]}),
@@ -214,6 +234,7 @@ def test_a_replaced_dataset_stops_the_sync_and_keeps_the_edits(loaded):
     _rename(layer, 2, "D")
     _add(layer)
     dock.sync_active_layer()
+    settle(dock)
     assert [method for method, *_ in server.writes] == ["PATCH"]
     assert layer.id() not in dock.baselines
     assert not dock.sync_button.isEnabled()
@@ -227,6 +248,7 @@ def test_a_server_without_table_ids_syncs_without_one(loaded):
     dock, layer = loaded(server := _Server(table_ids=[None], created_in=None))
     _rename(layer, 1, "B")
     dock.sync_active_layer()
+    settle(dock)
     assert [(method, query) for method, _, query, _ in server.writes] == [("PATCH", {})]
 
 
@@ -234,6 +256,7 @@ def test_a_replaced_dataset_gets_no_new_features(loaded):
     dock, layer = loaded(server := _Server(table_ids=[TABLE_ID, TABLE_ID, "777"]))
     _add(layer)
     dock.sync_active_layer()
+    settle(dock)
     assert server.writes == []
     assert layer.id() not in dock.baselines
     assert layer.isEditable()
@@ -244,6 +267,7 @@ def test_creates_wait_until_the_table_can_be_confirmed(loaded):
     dock, layer = loaded(server := _Server(table_ids=[TABLE_ID, TABLE_ID, FAIL]))
     _add(layer)
     dock.sync_active_layer()
+    settle(dock)
     assert server.writes == []
     assert layer.id() in dock.baselines
     assert "couldn't confirm" in _shown(dock)
@@ -254,6 +278,7 @@ def test_a_create_into_a_replacement_stops_the_sync(loaded):
     _add(layer)
     _add(layer)
     dock.sync_active_layer()
+    settle(dock)
     assert [method for method, *_ in server.writes] == ["POST"]
     assert layer.id() not in dock.baselines
     assert "One new feature was added" in _shown(dock)
@@ -285,6 +310,74 @@ def test_a_removed_field_is_reported_not_cleared(loaded, edit):
     if edit:
         _rename(layer, 1, "B")
     dock.sync_active_layer()
+    settle(dock)
     expected = [{"properties": {"name": "B"}}] if edit else []
     assert [body for *_, body in server.writes] == expected
     assert "keeps their values: score." in _shown(dock)
+
+
+def test_the_sync_runs_in_the_background_with_the_layer_locked(loaded):
+    dock, layer = loaded(server := _Server())
+    server.gate = threading.Event()
+    _rename(layer, 1, "B")
+    try:
+        dock.sync_active_layer()
+        assert dock.status.text() == "Synchronizing Roads…"
+        assert not dock.sync_button.isEnabled()
+        # An edit made now would join the session that stores new IDs.
+        assert not layer.startEditing()
+        dock.sync_active_layer()
+    finally:
+        server.gate.set()
+    settle(dock)
+    assert [method for method, *_ in server.writes] == ["PATCH"]
+    assert dock.sync_button.isEnabled()
+    assert layer.startEditing()
+    assert "Synchronized 1 change" in _shown(dock)
+
+
+def test_a_failed_write_is_reported_and_sync_stays_available(loaded):
+    dock, layer = loaded(server := _Server())
+    server.answers["PATCH"] = (500, {"detail": "Database unavailable"})
+    _rename(layer, 1, "B")
+    dock.sync_active_layer()
+    settle(dock)
+    assert "Synchronized 0/1; 1 failed" in _shown(dock)
+    assert dock.sync_button.isEnabled()
+    # Unsent, so the next sync tries it again.
+    del server.answers["PATCH"]
+    dock.sync_active_layer()
+    settle(dock)
+    assert [method for method, *_ in server.writes] == ["PATCH", "PATCH"]
+
+
+def test_a_reply_that_stops_the_sync_keeps_what_was_written(loaded, monkeypatch):
+    monkeypatch.setattr(
+        QMessageBox, "question", lambda *_: QMessageBox.StandardButton.Yes
+    )
+    dock, layer = loaded(server := _Server())
+    server.answers["DELETE"] = (200, b"<html>not json</html>")
+    _rename(layer, 1, "B")
+    layer.deleteFeature(_fid(layer, 2))
+    dock.sync_active_layer()
+    settle(dock)
+    assert [method for method, *_ in server.writes] == ["PATCH", "DELETE"]
+    assert not layer.readOnly()
+    # The rename reached the server, so only the delete is sent again.
+    dock.sync_active_layer()
+    settle(dock)
+    assert [method for method, *_ in server.writes] == ["PATCH", "DELETE", "DELETE"]
+
+
+def test_a_layer_removed_during_the_sync_still_gets_a_report(loaded):
+    dock, layer = loaded(server := _Server())
+    server.gate = threading.Event()
+    _add(layer)
+    try:
+        dock.sync_active_layer()
+        QgsProject.instance().removeMapLayer(layer.id())
+    finally:
+        server.gate.set()
+    settle(dock)
+    assert [method for method, *_ in server.writes] == ["POST"]
+    assert "Synchronized 1 change" in _shown(dock)

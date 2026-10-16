@@ -484,6 +484,10 @@
         <translation>Los campos eliminados no se sincronizan y GeoLens conserva sus valores: {fields}.</translation>
     </message>
     <message>
+        <source>Renewing tile access: {title}</source>
+        <translation>Renovando el acceso a las teselas: {title}</translation>
+    </message>
+    <message>
         <source>Report an issue</source>
         <translation>Informar de un problema</translation>
     </message>
@@ -586,6 +590,10 @@
     <message>
         <source>Synchronizing will delete {count} server features. Continue?</source>
         <translation>La sincronización eliminará {count} objetos espaciales del servidor. ¿Continuar?</translation>
+    </message>
+    <message>
+        <source>Synchronizing {title}…</source>
+        <translation>Sincronizando {title}…</translation>
     </message>
     <message>
         <source>Table</source>

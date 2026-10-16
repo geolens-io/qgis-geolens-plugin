@@ -1,6 +1,7 @@
 """The GeoLens Browser panel items against a real QGIS, with fake servers."""
 
 import json
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -17,6 +18,7 @@ from qgis.core import (  # noqa: E402
 )
 from qgis.PyQt.QtCore import QCoreApplication  # noqa: E402
 from qgis.PyQt.QtGui import QIcon  # noqa: E402
+from dock_tasks import settle  # noqa: E402
 from test_connection import (  # noqa: E402
     TEST_KEY,
     _FakeGeoLens,
@@ -61,9 +63,11 @@ class _Catalog:
         self.connection = connection
         self.datasets = list(datasets)
         self.searches = []
+        self.threads = []
 
     def search(self, query="", limit=50, sort_by=""):
         self.searches.append((limit, sort_by))
+        self.threads.append(threading.current_thread())
         return self.datasets
 
     def metadata_url(self, dataset_id):
@@ -186,6 +190,8 @@ def test_root_lists_saved_connections_and_their_datasets(browse, connections):
     datasets = {child.name(): child for child in panel.children(children[1])}
     assert [client.connection for client in factory.built] == [WORK]
     assert factory.built[0].searches == [(browser.BROWSER_LIMIT, "title")]
+    # QGIS lists a collection that isn't Fast on a worker thread.
+    assert factory.built[0].threads != [threading.main_thread()]
     roads, dem = datasets["Roads"], datasets["Elevation"]
     assert roads.path() == "geolens:/Work/roads"
     assert roads.toolTip() == "<p>Road &lt;b&gt;centrelines&lt;/b&gt;</p>"
@@ -369,6 +375,7 @@ def _connect_dock(dock, url):
     """Point the dock at `url` and connect, as a user would."""
     dock.use_server(url)
     dock.connect_server()
+    settle(dock)
 
 
 class _CountingGeoLens(_FakeGeoLens):
@@ -394,14 +401,15 @@ def test_browser_layers_renew_tokens_and_sync_with_their_own_server(
         work = GeoLensClient(WORK.url, opener=work_server)
         tagged = []
         tag = dock._tag_layer
-        dock._tag_layer = lambda layer, dataset, client=None: (
+        dock._tag_layer = lambda layer, dataset, client, detail: (
             tagged.append(client),
-            tag(layer, dataset, client=client),
+            tag(layer, dataset, client, detail),
         )
         datasets = browse(dock, lambda connection: work).datasets("Work")
         roads = datasets["Roads"]
         roads.handleDoubleClick()
         {a.text(): a for a in roads.actions(None)}["Add Features (Editable)"].trigger()
+        settle(dock)
         assert tagged == [work, work]
         # The layer-info detail read and the sync table-id reads go to the
         # Browser connection's server, not the panel's.
@@ -417,6 +425,7 @@ def test_browser_layers_renew_tokens_and_sync_with_their_own_server(
         timer = dock.refresh_timers[tiles.id()]
         work_server.paths.clear()
         timer.timeout.emit()
+        settle(dock)
         assert work_server.paths == ["/api/tiles/token/roads/"]
         assert dock_server.paths == []
         assert tiles.id() in dock.refresh_timers
@@ -437,12 +446,15 @@ def test_the_dock_buttons_still_add_from_the_dock_connection(
         dock.view_only.setChecked(False)
         _select(dock, "Roads")
         dock.add_tiles()
+        settle(dock)
         dock.add_features()
+        settle(dock)
         tiles, features = _roads_layers()
         assert tiles.customProperty("geolens/server") == "https://gis.example.org"
         assert features.id() in dock.baselines
         server.paths.clear()
         dock.refresh_timers[tiles.id()].timeout.emit()
+        settle(dock)
         assert server.paths == ["/api/tiles/token/roads/"]
     finally:
         dock.cleanup()
@@ -475,6 +487,7 @@ def test_saving_or_removing_a_connection_refreshes_the_browser(
         dock.key_edit.setText(TEST_KEY)
         dock.save_key.setChecked(True)
         dock.connect_server()
+        settle(dock)
         ((name, authcfg),) = listed()
         assert name == "gis.example.org" and authcfg
         dock.remove_connection()

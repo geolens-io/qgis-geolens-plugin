@@ -2,6 +2,7 @@
 
 import pathlib
 import sys
+import threading
 import types
 
 import pytest
@@ -112,6 +113,44 @@ def _install_qgis_stub():
 
 if HAS_PYQT6 and not HAS_REAL_QGIS:
     _install_qgis_stub()
+
+
+PLUGIN_ROOT = REPO_ROOT / "geolens_qgis"
+# The transport layer itself, which tests call directly.
+TRANSPORT = {PLUGIN_ROOT / "client.py", PLUGIN_ROOT / "connection.py"}
+
+
+@pytest.fixture(autouse=True)
+def requests_off_the_gui_thread(monkeypatch):
+    """Fail a test in which plugin code sends a request from the GUI thread.
+
+    A request waits for the server, which freezes QGIS. Tests may call the
+    client and the transport directly; the panel, the Browser and the layer
+    code must send theirs from background tasks. `publish/` is exempt.
+    """
+    from geolens_qgis.client import GeoLensClient
+
+    send = GeoLensClient._request
+    blocked = []
+
+    def request(self, path_or_url, *args, **kwargs):
+        if threading.current_thread() is threading.main_thread():
+            frame = sys._getframe(1)
+            while frame is not None:
+                path = pathlib.Path(frame.f_code.co_filename).resolve()
+                if (
+                    path.is_relative_to(PLUGIN_ROOT)
+                    and path not in TRANSPORT
+                    and not path.is_relative_to(PLUGIN_ROOT / "publish")
+                ):
+                    blocked.append(f"{path_or_url} from {path.name}")
+                    break
+                frame = frame.f_back
+        return send(self, path_or_url, *args, **kwargs)
+
+    monkeypatch.setattr(GeoLensClient, "_request", request)
+    yield
+    assert blocked == [], "requests sent from the GUI thread"
 
 
 @pytest.fixture
