@@ -14,7 +14,8 @@ from xmlrpc.client import Binary, SafeTransport, ServerProxy  # nosec B411
 
 # ServerProxy otherwise inherits the global default socket timeout, which is
 # None, so an unresponsive server would hang the job until the runner limit.
-DEFAULT_TIMEOUT = 60
+# plugins.qgis.org scans an upload before it replies, which can take over a minute.
+DEFAULT_TIMEOUT = 300
 
 
 class TimeoutTransport(SafeTransport):
