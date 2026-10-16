@@ -697,6 +697,9 @@ class GeoLensDock(QDockWidget):
         self.connect_button.setEnabled(
             self.connection_combo.currentIndex() >= 0 and "connect" not in running
         )
+        # A connect uses the key and save choice it started with.
+        for widget in (self.key_edit, self.save_key):
+            widget.setEnabled("connect" not in running)
         self.search_button.setEnabled(not running & {"connect", "search"})
         self.tiles_button.setEnabled(connected and dataset is not None and not adding)
         self.features_button.setEnabled(

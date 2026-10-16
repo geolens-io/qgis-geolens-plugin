@@ -919,22 +919,33 @@ def test_the_add_buttons_wait_for_the_server_then_come_back(
     assert len(_messages(qgis_iface)) == 1 - added
 
 
-def test_the_connect_button_comes_back_after_a_failed_connect(make_dock, qgis_iface):
+@pytest.mark.parametrize("succeeds", [True, False], ids=["success", "failure"])
+def test_the_connection_form_is_locked_until_the_connect_finishes(
+    make_dock, qgis_iface, succeeds
+):
     dock, server = make_dock(connect=False)
     server.gates["/api/search/datasets/"] = gate = threading.Event()
-    server.datasets = None
+    if not succeeds:
+        server.datasets = None
     dock.use_server(SERVER)
+    dock.key_edit.setText(KEY)
     qgis_iface.messageBar().clear_messages()
+    form = (dock.connect_button, dock.key_edit, dock.save_key)
     try:
         dock.connect_button.click()
         assert dock.status.text() == "Connecting…"
-        assert not dock.connect_button.isEnabled()
+        # A key typed now would not be the one the connect sends or saves.
+        assert not any(widget.isEnabled() for widget in form)
     finally:
         gate.set()
     settle(dock)
-    assert dock.connect_button.isEnabled() and dock.client is None
-    assert dock.status.text() == "Not connected."
-    assert len(_messages(qgis_iface)) == 1
+    assert all(widget.isEnabled() for widget in form)
+    assert (dock.client is not None) == succeeds
+    if succeeds:
+        assert dock.status.text().startswith("3 datasets on")
+    else:
+        assert dock.status.text() == "Not connected."
+        assert len(_messages(qgis_iface)) == 1
 
 
 def test_a_failed_tile_renewal_tries_again_in_a_minute(make_dock):
