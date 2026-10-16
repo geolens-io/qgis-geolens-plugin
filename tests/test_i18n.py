@@ -1,6 +1,7 @@
 """Translator loading, the About dialog and the extraction script."""
 
 import importlib.util
+import re
 import zipfile
 from pathlib import Path
 
@@ -151,3 +152,21 @@ def test_ts_update_keeps_existing_translations(tmp_path):
     missing = script.write_ts(ts, "es", {"Hello", "Bye", "New"})
     assert missing == 2
     assert script.read_translations(ts) == {"Bye": "Hola"}
+
+
+@pytest.mark.parametrize("language", ["es", "fr", "de", "zh"])
+def test_every_plugin_string_has_a_matching_translation(language):
+    script = _load_script()
+    translations = script.read_translations(
+        PLUGIN_DIR / "i18n" / f"geolens_{language}.ts"
+    )
+    sources = script.extract_strings(PLUGIN_DIR)
+    assert sorted(sources - set(translations)) == []
+    fields = re.compile(r"{(\w*)}")
+    mismatched = [
+        source
+        for source in sources
+        if sorted(fields.findall(source))
+        != sorted(fields.findall(translations[source]))
+    ]
+    assert mismatched == []

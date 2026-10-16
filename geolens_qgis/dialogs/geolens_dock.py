@@ -15,6 +15,7 @@ from qgis.PyQt.QtCore import (
     QCoreApplication,
     QEvent,
     QEventLoop,
+    QLocale,
     QPoint,
     QRectF,
     Qt,
@@ -168,9 +169,11 @@ def plain_error(text):
     )
 
 
-def count_text(count, one, many):
+def count_text(count, one, many, **fields):
     """`one` or `many` (translated, with a {count} field) for a count."""
-    return (one if count == 1 else many).format(count=f"{count:,}")
+    return (one if count == 1 else many).format(
+        count=QLocale().toString(count), **fields
+    )
 
 
 def _datasets_text(count):
@@ -736,7 +739,9 @@ class GeoLensDock(QDockWidget):
             )
         else:
             text = tr("{shown} of {datasets} shown on {server}.").format(
-                shown=f"{shown:,}", datasets=_datasets_text(total), server=server
+                shown=QLocale().toString(shown),
+                datasets=_datasets_text(total),
+                server=server,
             )
         editing = (
             tr("Editing is enabled.")
@@ -1102,23 +1107,27 @@ class GeoLensDock(QDockWidget):
     def _add_raster(self, client, dataset, source):
         layer = QgsRasterLayer(self._uri(source), dataset.title, "wms")
         if not layer.isValid():
-            raise GeoLensError("QGIS could not create the GeoLens raster tile layer")
+            raise GeoLensError(
+                tr("QGIS could not create the GeoLens raster tile layer")
+            )
         self._tag_layer(layer, dataset, client=client)
         QgsProject.instance().addMapLayer(layer)
         self._schedule_refresh(layer, dataset, source, "wms", client)
         self._zoom_to(dataset)
-        self._message(f"Added raster tiles: {dataset.title}")
+        self._message(tr("Added raster tiles: {title}").format(title=dataset.title))
 
     def _add_vector_tiles(self, client, dataset, source):
         layer = QgsVectorTileLayer(self._uri(source), dataset.title)
         if not layer.isValid():
-            raise GeoLensError("QGIS could not create the GeoLens vector tile layer")
+            raise GeoLensError(
+                tr("QGIS could not create the GeoLens vector tile layer")
+            )
         self._tag_layer(layer, dataset, client=client)
         layer.setCustomProperty("geolens/source_layer", source.get("source_layer", ""))
         QgsProject.instance().addMapLayer(layer)
         self._schedule_refresh(layer, dataset, source, "vectortile", client)
         self._zoom_to(dataset)
-        self._message(f"Added vector tiles: {dataset.title}")
+        self._message(tr("Added vector tiles: {title}").format(title=dataset.title))
 
     def _schedule_refresh(self, layer, dataset, source, provider, client=None):
         # The dock can reconnect to another server while this layer is open;
@@ -1200,7 +1209,9 @@ class GeoLensDock(QDockWidget):
             self.temp_files.append(path)
             layer = QgsVectorLayer(path, dataset.title, "ogr")
             if not layer.isValid():
-                raise GeoLensError("QGIS could not create the GeoLens feature layer")
+                raise GeoLensError(
+                    tr("QGIS could not create the GeoLens feature layer")
+                )
             self._tag_layer(layer, dataset, client=client)
             # Synchronization matches features by integer server ID. A dataset
             # that uses string or UUID identifiers would look entirely new and
@@ -1217,22 +1228,40 @@ class GeoLensDock(QDockWidget):
             QSettings().setValue("geolens/feature_limit", self.limit.value())
             if syncable:
                 self._message(
-                    f"Added {layer.featureCount():,} editable features: {dataset.title}"
+                    count_text(
+                        layer.featureCount(),
+                        tr("Added {count} editable feature: {title}"),
+                        tr("Added {count} editable features: {title}"),
+                        title=dataset.title,
+                    )
                 )
             elif refusal:
                 self._message(
                     tr("Added {count} features: {title}. {reason}").format(
-                        count=f"{layer.featureCount():,}",
+                        count=QLocale().toString(layer.featureCount()),
                         title=dataset.title,
                         reason=refusal,
                     ),
                     Qgis.MessageLevel.Warning,
                 )
             else:
+                reason = count_text(
+                    unidentified,
+                    tr(
+                        "{count} feature has no integer server ID, so "
+                        "synchronization is disabled for this layer."
+                    ),
+                    tr(
+                        "{count} features have no integer server ID, so "
+                        "synchronization is disabled for this layer."
+                    ),
+                )
                 self._message(
-                    f"Added {layer.featureCount():,} features: {dataset.title}. "
-                    f"{unidentified:,} feature(s) have no integer server ID, so "
-                    "synchronization is disabled for this layer.",
+                    tr("Added {count} features: {title}. {reason}").format(
+                        count=QLocale().toString(layer.featureCount()),
+                        title=dataset.title,
+                        reason=reason,
+                    ),
                     Qgis.MessageLevel.Warning,
                 )
         except (GeoLensError, OSError) as error:
@@ -1258,7 +1287,7 @@ class GeoLensDock(QDockWidget):
         layer = self.iface.activeLayer()
         if not self.client or not isinstance(layer, QgsVectorLayer):
             self._message(
-                "Select an editable feature layer loaded from GeoLens.",
+                tr("Select an editable feature layer loaded from GeoLens."),
                 Qgis.MessageLevel.Warning,
             )
             return
@@ -1266,9 +1295,11 @@ class GeoLensDock(QDockWidget):
         baseline = self.baselines.get(layer.id())
         if not dataset_id or baseline is None:
             self._message(
-                "The selected layer has no GeoLens edit baseline in this session. "
-                "Reload it with Add features; datasets without integer feature "
-                "IDs cannot be synchronized.",
+                tr(
+                    "The selected layer has no GeoLens edit baseline in this "
+                    "session. Reload it with Add features; datasets without "
+                    "integer feature IDs cannot be synchronized."
+                ),
                 Qgis.MessageLevel.Warning,
             )
             return
@@ -1278,11 +1309,15 @@ class GeoLensDock(QDockWidget):
             # issued the layer, so its edits go to no other server.
             self._message(
                 (
-                    f"This layer came from {origin}. Connect to that server to "
-                    "synchronize its edits."
+                    tr(
+                        "This layer came from {origin}. Connect to that server "
+                        "to synchronize its edits."
+                    ).format(origin=origin)
                     if origin
-                    else "This layer doesn't record which GeoLens server it came "
-                    "from, so its edits can't be synchronized."
+                    else tr(
+                        "This layer doesn't record which GeoLens server it came "
+                        "from, so its edits can't be synchronized."
+                    )
                 ),
                 Qgis.MessageLevel.Warning,
             )
@@ -1290,7 +1325,7 @@ class GeoLensDock(QDockWidget):
         editing = layer.isEditable()
         if editing and not layer.commitChanges():
             self._message(
-                "Commit the QGIS layer edits before synchronizing.",
+                tr("Commit the QGIS layer edits before synchronizing."),
                 Qgis.MessageLevel.Warning,
             )
             return
@@ -1325,14 +1360,18 @@ class GeoLensDock(QDockWidget):
             if unsynced:
                 self._message(unsynced, Qgis.MessageLevel.Warning)
             else:
-                self._message("No local changes to synchronize.")
+                self._message(tr("No local changes to synchronize."))
             return
         if (
             deletes
             and QMessageBox.question(
                 self,
-                "Delete GeoLens features",
-                f"Synchronizing will delete {len(deletes)} server feature(s). Continue?",
+                tr("Delete GeoLens features"),
+                count_text(
+                    len(deletes),
+                    tr("Synchronizing will delete {count} server feature. Continue?"),
+                    tr("Synchronizing will delete {count} server features. Continue?"),
+                ),
             )
             != QMessageBox.StandardButton.Yes
         ):
@@ -1404,8 +1443,10 @@ class GeoLensDock(QDockWidget):
                 # below and the layer has to be reloaded first.
                 unaddressable += 1
                 errors.append(
-                    "A feature was created, but GeoLens returned no integer ID "
-                    "for it. Reload the layer before synchronizing again."
+                    tr(
+                        "A feature was created, but GeoLens returned no integer "
+                        "ID for it. Reload the layer before synchronizing again."
+                    )
                 )
                 continue
             baseline[gid] = feature
@@ -1419,9 +1460,19 @@ class GeoLensDock(QDockWidget):
             if not layer.commitChanges():
                 unaddressable += len(created)
                 errors.append(
-                    f"{len(created)} feature(s) were created, but their server "
-                    "IDs could not be stored locally. Reload the layer before "
-                    "synchronizing again."
+                    count_text(
+                        len(created),
+                        tr(
+                            "{count} feature was created, but its server ID "
+                            "could not be stored locally. Reload the layer "
+                            "before synchronizing again."
+                        ),
+                        tr(
+                            "{count} features were created, but their server "
+                            "IDs could not be stored locally. Reload the layer "
+                            "before synchronizing again."
+                        ),
+                    )
                 )
         if unaddressable:
             # Features live on the server that this layer cannot match again.
@@ -1429,16 +1480,32 @@ class GeoLensDock(QDockWidget):
             self._update_actions()
         if errors:
             self._message(
-                f"Synchronized {total - len(errors)}/{total}; {len(errors)} failed. {errors[0]}",
+                tr("Synchronized {done}/{total}; {failed} failed. {error}").format(
+                    done=total - len(errors),
+                    total=total,
+                    failed=len(errors),
+                    error=errors[0],
+                ),
                 Qgis.MessageLevel.Warning,
             )
         elif unsynced:
             self._message(
-                f"Synchronized {total} change(s) to GeoLens. {unsynced}",
+                count_text(
+                    total,
+                    tr("Synchronized {count} change to GeoLens. {unsynced}"),
+                    tr("Synchronized {count} changes to GeoLens. {unsynced}"),
+                    unsynced=unsynced,
+                ),
                 Qgis.MessageLevel.Warning,
             )
         else:
-            self._message(f"Synchronized {total} change(s) to GeoLens.")
+            self._message(
+                count_text(
+                    total,
+                    tr("Synchronized {count} change to GeoLens."),
+                    tr("Synchronized {count} changes to GeoLens."),
+                )
+            )
 
     def _start_sync_baseline(self, client, layer, dataset_id, before):
         """Record what later edits are diffed against; return why sync is refused.
