@@ -1264,12 +1264,17 @@ class GeoLensDock(QDockWidget):
             timer.deleteLater()
 
     def _current_bbox(self):
+        """The map extent in EPSG:4326, or None when the map shows no area yet."""
         extent = self.iface.mapCanvas().extent()
+        if extent.isEmpty():
+            return None
         crs = self.iface.mapCanvas().mapSettings().destinationCrs()
         if crs != QgsCoordinateReferenceSystem("EPSG:4326"):
             extent = QgsCoordinateTransform(
                 crs, QgsCoordinateReferenceSystem("EPSG:4326"), QgsProject.instance()
             ).transformBoundingBox(extent)
+        if extent.isEmpty() or not extent.isFinite():
+            return None
         return (
             extent.xMinimum(),
             extent.yMinimum(),
