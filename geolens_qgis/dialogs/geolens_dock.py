@@ -9,12 +9,12 @@ import json
 import os
 import re
 import tempfile
+import traceback
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
 from qgis.PyQt.QtCore import (
-    QCoreApplication,
     QEvent,
-    QEventLoop,
     QLocale,
     QPoint,
     QRectF,
@@ -33,7 +33,6 @@ from qgis.PyQt.QtGui import (
 )
 from qgis.PyQt.QtWidgets import (
     QAbstractItemView,
-    QApplication,
     QCheckBox,
     QComboBox,
     QDockWidget,
@@ -99,7 +98,7 @@ from ..connections import (
     unique_name,
 )
 from ..i18n import tr
-from ..layer_info import apply_layer_info
+from ..layer_info import build_metadata, fetch_detail
 from .connection_dialog import ConnectionDialog
 
 ROLE_DATASET = Qt.ItemDataRole.UserRole
@@ -264,7 +263,10 @@ class GeoLensDock(QDockWidget):
         self._query = ""
         self._thumbnails: dict[tuple, bytes] = {}
         self._pending: dict[tuple, QgsTask] = {}
-        self._thumbnail_client = None
+        # Replaced tasks by id until they finish: QGIS calls a task's Python
+        # callback only while Python still holds a reference to the task.
+        self._dropped: dict[int, QgsTask] = {}
+        self._work_client = None
         self._hover_pos = QPoint()
         self._build_ui()
         self._restore_settings()
@@ -567,6 +569,8 @@ class GeoLensDock(QDockWidget):
 
     def _connection_chosen(self, *_):
         self._stash_session_key()
+        # A connect still running was asked for the connection being left.
+        self._drop(("connect",))
         connection = self._current_connection()
         set_current_connection(connection.name if connection else "")
         connected = self._connected_to
@@ -581,13 +585,14 @@ class GeoLensDock(QDockWidget):
             self._disconnect()
         self._key_owner = connection
         self.key_edit.setText(self._key_for(connection))
-        for widget in (self.edit_button, self.remove_button, self.connect_button):
+        for widget in (self.edit_button, self.remove_button):
             widget.setEnabled(connection is not None)
         self.connection_box.setTitle(
             tr("Connection: {name}").format(name=connection.name)
             if connection
             else tr("Connection")
         )
+        self._update_actions()
 
     def _key_for(self, connection) -> str:
         """The session or legacy key saved for `connection`'s origin, or ""."""
@@ -687,9 +692,18 @@ class GeoLensDock(QDockWidget):
     def _update_actions(self, *_):
         dataset = self._selected_dataset()
         connected = self.client is not None
-        self.tiles_button.setEnabled(connected and dataset is not None)
+        running = {key[0] for key in self._pending}
+        adding = self._adding()
+        self.connect_button.setEnabled(
+            self.connection_combo.currentIndex() >= 0 and "connect" not in running
+        )
+        # A connect uses the key and save choice it started with.
+        for widget in (self.key_edit, self.save_key):
+            widget.setEnabled("connect" not in running)
+        self.search_button.setEnabled(not running & {"connect", "search"})
+        self.tiles_button.setEnabled(connected and dataset is not None and not adding)
         self.features_button.setEnabled(
-            connected and dataset is not None and not dataset.is_raster
+            connected and dataset is not None and not dataset.is_raster and not adding
         )
         self.metadata_button.setEnabled(connected and dataset is not None)
         self.type_filter.setEnabled(connected)
@@ -702,7 +716,15 @@ class GeoLensDock(QDockWidget):
                 and self.editing_enabled
                 and layer
                 and layer.id() in self.baselines
+                and "sync" not in running
             )
+        )
+
+    def _adding(self):
+        """Whether an add started from the panel's buttons is still running."""
+        return any(
+            key[0] in ("tiles", "features") and key[1] is self.client
+            for key in self._pending
         )
 
     def _message(self, text, level=Qgis.MessageLevel.Info):
@@ -712,21 +734,76 @@ class GeoLensDock(QDockWidget):
             QgsMessageLog.logMessage(text, LOG_TAG, Qgis.MessageLevel.Warning)
         self.iface.messageBar().pushMessage("GeoLens", shown, level=level, duration=6)
 
-    @contextlib.contextmanager
-    def _busy(self, text):
-        self.status.setText(text)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        # Repaint the status line; user input stays queued until the call ends.
-        QCoreApplication.processEvents(
-            QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents
-        )
-        try:
-            yield
-        finally:
-            QApplication.restoreOverrideCursor()
+    def _report(self, error):
+        """Show why a background task failed, logging the traceback of a bug."""
+        if not isinstance(error, (GeoLensError, ValueError, OSError)):
+            QgsMessageLog.logMessage(
+                "".join(
+                    traceback.format_exception(type(error), error, error.__traceback__)
+                ),
+                LOG_TAG,
+                Qgis.MessageLevel.Critical,
+            )
+        self._message(str(error), Qgis.MessageLevel.Critical)
+
+    def _run(
+        self, key, description, work, done, failed=None, quiet=False, follows=False
+    ):
+        """Run `work()` in a QGIS background task and pass its result to `done`.
+
+        `done(result)`, or `failed(error)` when `work` raises, runs on the GUI
+        thread; `failed` defaults to reporting the error. A task started later
+        under the same `key` replaces this one. With `follows`, the task is
+        also dropped when the dock's client changes. A replaced or dropped
+        task's result is ignored, as is every result after `cleanup`. Unless
+        `quiet`, the status line shows `description` while the task runs.
+        """
+
+        def run(_task):
+            # QgsTask hands on_finished nothing at all for a falsy result.
+            return (work(),)
+
+        def finished(exception, value=None):
+            self._dropped.pop(id(task), None)
+            if self._pending.get(key) is not task:
+                return
+            del self._pending[key]
+            self._update_actions()
             self._refresh_status()
+            if exception is None:
+                done(value[0])
+            else:
+                (failed or self._report)(exception)
+
+        # Without CanCancel: a cancel would not stop the request, only lose
+        # its result.
+        task = QgsTask.fromFunction(
+            description, run, on_finished=finished, flags=QgsTask.Flag.Silent
+        )
+        task.follows_client = follows
+        task.status_text = "" if quiet else description
+        self._drop(key)
+        self._pending[key] = task
+        QgsApplication.taskManager().addTask(task)
+        self._update_actions()
+        self._refresh_status()
+
+    def _drop(self, *keys):
+        """Forget the tasks under `keys`; whatever they return is ignored."""
+        for key in keys:
+            task = self._pending.pop(key, None)
+            if task is not None:
+                task.cancel()
+                self._dropped[id(task)] = task
+        self._update_actions()
+        self._refresh_status()
 
     def _refresh_status(self):
+        running = [task.status_text for task in self._pending.values()]
+        running = [text for text in running if text]
+        if running:
+            self.status.setText(running[-1])
+            return
         if not self.client:
             self.status.setText(tr("Not connected."))
             return
@@ -751,14 +828,10 @@ class GeoLensDock(QDockWidget):
         self.status.setText(f"{text} {editing}")
 
     def _connect_clicked(self, *_):
-        with self._busy(tr("Connecting…")):
-            self.connect_server()
+        self.connect_server()
 
     def _add(self, action):
-        dataset = self._selected_dataset()
-        if not dataset:
-            return
-        with self._busy(tr("Adding {title}…").format(title=dataset.title)):
+        if self._selected_dataset() and not self._adding():
             action()
 
     def _add_item(self, item, *_):
@@ -807,18 +880,30 @@ class GeoLensDock(QDockWidget):
                 api_key=key,
                 opener=self._opener,
             )
-            datasets = connection.connect()
         except (ValueError, GeoLensError) as error:
-            self._disconnect()
-            self.connection_box.setCollapsed(False)
-            self._message(str(error), Qgis.MessageLevel.Critical)
+            self._connect_failed(error)
             return
+        save = key if self.save_key.isChecked() else ""
+        self._run(
+            ("connect",),
+            tr("Connecting…"),
+            connection.connect,
+            lambda datasets: self._connected(connection, saved, save, datasets),
+            failed=self._connect_failed,
+        )
+
+    def _connect_failed(self, error):
+        self._disconnect()
+        self.connection_box.setCollapsed(False)
+        self._report(error)
+
+    def _connected(self, connection, saved, save_key, datasets):
         self.connection = connection
         self._connected_to = saved
         self.client = connection.client
         self.editing_enabled = connection.capabilities["dataset_editing"]
-        if key and self.save_key.isChecked():
-            self._save_key(key, saved)
+        if save_key:
+            self._save_key(save_key, saved)
         self._show_datasets(datasets)
         if self.search_edit.text().strip():
             # The box still holds a query, so the list has to answer it.
@@ -833,6 +918,7 @@ class GeoLensDock(QDockWidget):
 
     def _disconnect(self):
         """Forget the current connection and the catalog it returned."""
+        self._drop(("connect",))
         self.connection = None
         self._connected_to = None
         self.client = None
@@ -874,15 +960,17 @@ class GeoLensDock(QDockWidget):
             self._connect_clicked()
             return
         query = self.search_edit.text()
-        try:
-            with self._busy(tr("Searching…")):
-                datasets = self.client.search(query, 50)
-                self._show_datasets(datasets, query)
-        except GeoLensError as error:
-            self._message(str(error), Qgis.MessageLevel.Critical)
+        client = self.client
+        self._run(
+            ("search",),
+            tr("Searching…"),
+            lambda: client.search(query, 50),
+            lambda datasets: self._show_datasets(datasets, query),
+            follows=True,
+        )
 
     def _show_datasets(self, datasets, query=""):
-        self._forget_thumbnails_for_other_client()
+        self._forget_work_for_other_client()
         self._loaded = list(datasets)
         self._query = query.strip()
         self.datasets = {dataset.id: dataset for dataset in datasets}
@@ -893,18 +981,16 @@ class GeoLensDock(QDockWidget):
             self.sort_combo.setCurrentIndex(0)
         self._populate()
 
-    def _forget_thumbnails_for_other_client(self):
-        """Drop previews fetched under a client that has since been replaced.
+    def _forget_work_for_other_client(self):
+        """Drop previews and tasks started under a client since replaced.
 
         The same server may answer differently to other credentials.
         """
-        if self.client is self._thumbnail_client:
+        if self.client is self._work_client:
             return
-        self._thumbnail_client = self.client
+        self._work_client = self.client
         self._thumbnails.clear()
-        pending, self._pending = self._pending, {}
-        for task in pending.values():
-            task.cancel()
+        self._drop(*[key for key, task in self._pending.items() if task.follows_client])
 
     def _populate(self, *_):
         """Fill the list from the loaded datasets, filtered and sorted here."""
@@ -982,41 +1068,31 @@ class GeoLensDock(QDockWidget):
         if not (self.client and dataset.has_quicklook):
             return None
         key = (self.client.base_url, dataset.id, dataset.quicklook_version)
-        if key not in self._thumbnails and key not in self._pending:
+        if key not in self._thumbnails and ("preview", *key) not in self._pending:
             self._fetch_thumbnail(key, dataset, self.client)
         return self._thumbnails.get(key)
 
     def _fetch_thumbnail(self, key, dataset, client):
-        # QgsBlockingNetworkRequest belongs on a worker thread, and a slow
-        # server must not freeze the window on hover.
-        def work(task):
-            return client.quicklook(dataset.id, dataset.quicklook_version)
-
-        def finished(exception, data=None):
-            # A fetch started under a replaced client or a closed dock is stale.
-            if self._pending.get(key) is not task:
-                return
-            del self._pending[key]
-            valid = (
-                exception is None
-                and data
+        def done(data):
+            if (
+                data
                 and len(data) <= MAX_THUMBNAIL_BYTES
                 and not QImage.fromData(data).isNull()
-            )
-            if not valid:
-                if exception is not None:
-                    QgsMessageLog.logMessage(
-                        str(exception), LOG_TAG, Qgis.MessageLevel.Info
-                    )
-                return
-            self._thumbnails[key] = data
-            self._show_thumbnail(key)
+            ):
+                self._thumbnails[key] = data
+                self._show_thumbnail(key)
 
-        task = QgsTask.fromFunction(
-            tr("Loading a dataset preview"), work, on_finished=finished
+        self._run(
+            ("preview", *key),
+            tr("Loading a dataset preview"),
+            lambda: client.quicklook(dataset.id, dataset.quicklook_version),
+            done,
+            failed=lambda error: QgsMessageLog.logMessage(
+                str(error), LOG_TAG, Qgis.MessageLevel.Info
+            ),
+            quiet=True,
+            follows=True,
         )
-        self._pending[key] = task
-        QgsApplication.taskManager().addTask(task)
 
     def _hovered_dataset_id(self):
         viewport = self.results.viewport()
@@ -1075,14 +1151,24 @@ class GeoLensDock(QDockWidget):
 
     def add_dataset_tiles(self, client, dataset):
         """Add `dataset` as a tile layer served, and kept renewed, by `client`."""
-        try:
-            source = client.tile_source(dataset.id)
-            if source.get("kind") == "raster":
-                self._add_raster(client, dataset, source)
-            else:
-                self._add_vector_tiles(client, dataset, source)
-        except GeoLensError as error:
-            self._message(str(error), Qgis.MessageLevel.Critical)
+
+        def done(result):
+            source, detail = result
+            try:
+                if source.get("kind") == "raster":
+                    self._add_raster(client, dataset, source, detail)
+                else:
+                    self._add_vector_tiles(client, dataset, source, detail)
+            except GeoLensError as error:
+                self._message(str(error), Qgis.MessageLevel.Critical)
+
+        self._run(
+            ("tiles", client, dataset.id),
+            tr("Adding {title}…").format(title=dataset.title),
+            lambda: (client.tile_source(dataset.id), fetch_detail(client, dataset.id)),
+            done,
+            follows=client is self.client,
+        )
 
     def _uri(self, source):
         # Never put an API key in a layer URI: QGIS persists layer sources in
@@ -1097,32 +1183,33 @@ class GeoLensDock(QDockWidget):
             uri.setParam("zmax", str(source["maxzoom"]))
         return bytes(uri.encodedUri()).decode()
 
-    def _tag_layer(self, layer, dataset, client=None):
-        client = client or self.client
+    def _tag_layer(self, layer, dataset, client, detail):
+        """Record where the layer came from and describe it with `detail`."""
+        page = client.metadata_url(dataset.id)
         layer.setCustomProperty("geolens/server", client.base_url)
         layer.setCustomProperty("geolens/dataset_id", dataset.id)
-        layer.setCustomProperty("geolens/metadata_url", client.metadata_url(dataset.id))
-        apply_layer_info(layer, dataset, client)
+        layer.setCustomProperty("geolens/metadata_url", page)
+        layer.setMetadata(build_metadata(dataset, detail, page))
 
-    def _add_raster(self, client, dataset, source):
+    def _add_raster(self, client, dataset, source, detail):
         layer = QgsRasterLayer(self._uri(source), dataset.title, "wms")
         if not layer.isValid():
             raise GeoLensError(
                 tr("QGIS could not create the GeoLens raster tile layer")
             )
-        self._tag_layer(layer, dataset, client=client)
+        self._tag_layer(layer, dataset, client, detail)
         QgsProject.instance().addMapLayer(layer)
         self._schedule_refresh(layer, dataset, source, "wms", client)
         self._zoom_to(dataset)
         self._message(tr("Added raster tiles: {title}").format(title=dataset.title))
 
-    def _add_vector_tiles(self, client, dataset, source):
+    def _add_vector_tiles(self, client, dataset, source, detail):
         layer = QgsVectorTileLayer(self._uri(source), dataset.title)
         if not layer.isValid():
             raise GeoLensError(
                 tr("QGIS could not create the GeoLens vector tile layer")
             )
-        self._tag_layer(layer, dataset, client=client)
+        self._tag_layer(layer, dataset, client, detail)
         layer.setCustomProperty("geolens/source_layer", source.get("source_layer", ""))
         QgsProject.instance().addMapLayer(layer)
         self._schedule_refresh(layer, dataset, source, "vectortile", client)
@@ -1138,19 +1225,32 @@ class GeoLensDock(QDockWidget):
         timer = QTimer(self)
         timer.setSingleShot(True)
 
-        def refresh():
+        def renewed(renewal):
             # Removing a layer deletes the object behind `layer`, so look it
             # up again instead of touching the stale wrapper.
             live = QgsProject.instance().mapLayer(layer_id)
             if not live:
                 self._drop_refresh_timer(layer_id)
                 return
-            try:
-                renewed = client.tile_source(dataset.id)
-                live.setDataSource(self._uri(renewed), live.name(), provider)
-                self._schedule_refresh(live, dataset, renewed, provider, client)
-            except GeoLensError:
+            live.setDataSource(self._uri(renewal), live.name(), provider)
+            self._schedule_refresh(live, dataset, renewal, provider, client)
+
+        def retry(_error):
+            if self.refresh_timers.get(layer_id) is timer:
                 timer.start(60_000)
+
+        def refresh():
+            if not QgsProject.instance().mapLayer(layer_id):
+                self._drop_refresh_timer(layer_id)
+                return
+            self._run(
+                ("renew", layer_id),
+                tr("Renewing tile access: {title}").format(title=dataset.title),
+                lambda: client.tile_source(dataset.id),
+                renewed,
+                failed=retry,
+                quiet=True,
+            )
 
         timer.timeout.connect(refresh)
         timer.start(seconds * 1000)
@@ -1184,24 +1284,19 @@ class GeoLensDock(QDockWidget):
 
     def add_dataset_features(self, client, dataset):
         """Download `dataset` from `client` as an editable layer with a sync baseline."""
+        bbox = self._current_bbox() if self.view_only.isChecked() else None
+        limit = self.limit.value()
+        self._run(
+            ("features", client, dataset.id),
+            tr("Adding {title}…").format(title=dataset.title),
+            lambda: _download_features(client, dataset.id, limit, bbox),
+            lambda download: self._add_feature_layer(client, dataset, limit, download),
+            follows=client is self.client,
+        )
+
+    def _add_feature_layer(self, client, dataset, limit, download):
+        collection, unidentified, table_before, table_after, detail = download
         try:
-            bbox = self._current_bbox() if self.view_only.isChecked() else None
-            before = _table_id_probe(client, dataset.id)
-            collection = client.features(dataset.id, self.limit.value(), bbox)
-            baseline = {}
-            unidentified = 0
-            for feature in collection["features"]:
-                # GeoJSON permits "properties": null, which setdefault keeps.
-                props = feature.get("properties")
-                if not isinstance(props, dict):
-                    props = {}
-                    feature["properties"] = props
-                gid = feature.get("id", props.get("gid"))
-                if isinstance(gid, int) and not isinstance(gid, bool):
-                    props["_geolens_gid"] = gid
-                    baseline[gid] = _clean_feature(feature)
-                else:
-                    unidentified += 1
             handle, path = tempfile.mkstemp(prefix="geolens_", suffix=".geojson")
             os.close(handle)
             with open(path, "w", encoding="utf-8") as stream:
@@ -1212,20 +1307,19 @@ class GeoLensDock(QDockWidget):
                 raise GeoLensError(
                     tr("QGIS could not create the GeoLens feature layer")
                 )
-            self._tag_layer(layer, dataset, client=client)
+            self._tag_layer(layer, dataset, client, detail)
             # Synchronization matches features by integer server ID. A dataset
             # that uses string or UUID identifiers would look entirely new and
             # be duplicated onto the server, so it is loaded read-only instead.
             syncable = unidentified == 0
             refusal = ""
             if syncable:
-                self.baselines[layer.id()] = baseline
-                refusal = self._start_sync_baseline(client, layer, dataset.id, before)
+                refusal = self._start_sync_baseline(layer, table_before, table_after)
                 syncable = not refusal
             layer.setCustomProperty("geolens/editable", syncable)
             QgsProject.instance().addMapLayer(layer)
             self._zoom_to(dataset)
-            QSettings().setValue("geolens/feature_limit", self.limit.value())
+            QSettings().setValue("geolens/feature_limit", limit)
             if syncable:
                 self._message(
                     count_text(
@@ -1284,6 +1378,8 @@ class GeoLensDock(QDockWidget):
             self._open_url(self.client.metadata_url(dataset.id))
 
     def sync_active_layer(self):
+        if any(key[0] == "sync" for key in self._pending):
+            return
         layer = self.iface.activeLayer()
         if not self.client or not isinstance(layer, QgsVectorLayer):
             self._message(
@@ -1377,82 +1473,50 @@ class GeoLensDock(QDockWidget):
         ):
             return
         table_id = str(layer.customProperty("geolens/table_id", "") or "")
-        errors = []
-        # Creates carry no table id, so they go last, after a guarded write
-        # or a fresh read has shown the table is still the one loaded.
-        confirmed = False
-        for gid, changes, feature in updates:
-            if "geometry" in changes and changes["geometry"] is None:
-                errors.append(
-                    tr(
-                        "Feature {gid} lost its geometry, which GeoLens can't "
-                        "store. Undo that edit or delete the feature."
-                    ).format(gid=gid)
-                )
-                continue
-            try:
-                self.client.patch_feature(dataset_id, gid, changes, table_id)
-                baseline[gid] = feature
-                confirmed = True
-            except GeoLensError as error:
-                if _dataset_replaced(error):
-                    self._stop_replaced_sync(layer, editing)
-                    return
-                errors.append(str(error))
-        for gid in deletes:
-            try:
-                self.client.delete_feature(dataset_id, gid, table_id)
-                baseline.pop(gid, None)
-                confirmed = True
-            except GeoLensError as error:
-                if _dataset_replaced(error):
-                    self._stop_replaced_sync(layer, editing)
-                    return
-                errors.append(str(error))
-        if creates and table_id and not confirmed:
-            gid = min(baseline) if baseline else None
-            current = _current_table_id(self.client, dataset_id, gid)
-            if current is None:
-                # One message per refused create keeps the failure count right.
-                errors += [
-                    tr(
-                        "GeoLens couldn't confirm that the dataset is still the "
-                        "one this layer was loaded from, so new features weren't "
-                        "sent. Try again, or load the dataset again with Add "
-                        "features."
-                    )
-                ] * len(creates)
-                creates = []
-            elif current != table_id:
-                self._stop_replaced_sync(layer, editing)
-                return
-        created = []
-        unaddressable = 0
-        for fid, feature in creates:
-            try:
-                gid, created_in = self.client.create_feature(dataset_id, feature)
-            except GeoLensError as error:
-                errors.append(str(error))
-                continue
-            if created_in and table_id and created_in != table_id:
-                self._stop_replaced_sync(layer, editing, created_one=True)
-                return
-            if gid is None:
-                # The feature exists on the server but cannot be addressed, so
-                # a second sync would create it again. The baseline is dropped
-                # below and the layer has to be reloaded first.
-                unaddressable += 1
-                errors.append(
-                    tr(
-                        "A feature was created, but GeoLens returned no integer "
-                        "ID for it. Reload the layer before synchronizing again."
-                    )
-                )
-                continue
+        layer_id = layer.id()
+        client = self.client
+        gids = set(baseline)
+        outcome = _SyncOutcome()
+
+        def finish(_=None, error=None):
+            self._synced(layer_id, editing, total, unsynced, outcome, error)
+
+        # Edits made while the writes are in flight would join the edit
+        # session that stores the new server IDs.
+        layer.setReadOnly(True)
+        self._run(
+            ("sync", layer_id),
+            tr("Synchronizing {title}…").format(title=layer.name()),
+            lambda: _send_edits(
+                outcome, client, dataset_id, table_id, updates, deletes, creates, gids
+            ),
+            finish,
+            failed=lambda error: finish(error=error),
+        )
+
+    def _synced(self, layer_id, editing, total, unsynced, outcome, error=None):
+        """Apply what `_send_edits` got done to the layer and its baseline.
+
+        `error` is what stopped the writes early, if anything.
+        """
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if layer is not None:
+            layer.setReadOnly(False)
+        if outcome.replaced:
+            self._stop_replaced_sync(layer_id, editing, outcome.created_one)
+            return
+        baseline = self.baselines.get(layer_id, {})
+        for gid, feature in outcome.written:
             baseline[gid] = feature
-            created.append((fid, gid))
+        for gid in outcome.deleted:
+            baseline.pop(gid, None)
+        for _, gid, feature in outcome.created:
+            baseline[gid] = feature
+        errors = list(outcome.errors)
+        unaddressable = outcome.unaddressable
+        created = [(fid, gid) for fid, gid, _ in outcome.created]
         # One edit session for every new ID: each commit rewrites the layer file.
-        gid_index = layer.fields().indexOf("_geolens_gid")
+        gid_index = layer.fields().indexOf("_geolens_gid") if layer else -1
         if created and gid_index >= 0:
             layer.startEditing()
             for fid, gid in created:
@@ -1476,8 +1540,11 @@ class GeoLensDock(QDockWidget):
                 )
         if unaddressable:
             # Features live on the server that this layer cannot match again.
-            self.baselines.pop(layer.id(), None)
+            self.baselines.pop(layer_id, None)
             self._update_actions()
+        if error is not None:
+            self._report(error)
+            return
         if errors:
             self._message(
                 tr("Synchronized {done}/{total}; {failed} failed. {error}").format(
@@ -1507,15 +1574,15 @@ class GeoLensDock(QDockWidget):
                 )
             )
 
-    def _start_sync_baseline(self, client, layer, dataset_id, before):
+    def _start_sync_baseline(self, layer, table_before, table_after):
         """Record what later edits are diffed against; return why sync is refused.
 
         QGIS rewrites some values it loads (a datetime gains milliseconds), so
         edits are compared with its export of the layer, not the server's JSON.
-        `before` is `_table_id_probe` from just before the load; the table id
-        read now must match it, or the layer's features may come from two
-        tables. An empty id means the server reports none, and writes then go
-        unguarded. Returns "" when sync is enabled.
+        The table ids read just before and just after the download must match,
+        or the layer's features may come from two tables. An empty id means
+        the server reports none, and writes then go unguarded; None means it
+        couldn't be read. Returns "" when sync is enabled.
         """
         baseline = {
             gid: feature
@@ -1523,9 +1590,6 @@ class GeoLensDock(QDockWidget):
             if isinstance(gid, int)
         }
         self.baselines[layer.id()] = baseline
-        probe_gid, table_before = before
-        gid = min(baseline) if baseline else probe_gid
-        table_after = "" if gid is None else _current_table_id(client, dataset_id, gid)
         if table_before is None or table_after is None:
             refusal = tr(
                 "GeoLens couldn't confirm which version of the dataset was "
@@ -1544,12 +1608,13 @@ class GeoLensDock(QDockWidget):
         self.baselines.pop(layer.id(), None)
         return refusal
 
-    def _stop_replaced_sync(self, layer, editing, created_one=False):
+    def _stop_replaced_sync(self, layer_id, editing, created_one=False):
         # Feature ids may now name other features, so nothing may be written
         # from this layer again.
-        self.baselines.pop(layer.id(), None)
+        self.baselines.pop(layer_id, None)
         self._update_actions()
-        if editing:
+        layer = QgsProject.instance().mapLayer(layer_id)
+        if editing and layer is not None:
             layer.startEditing()
         if created_one:
             text = tr(
@@ -1569,8 +1634,8 @@ class GeoLensDock(QDockWidget):
         self._message(text, Qgis.MessageLevel.Critical)
 
     def cleanup(self):
-        """Stop following the active layer and tile refresh timers, and delete
-        downloaded feature files.
+        """Stop following the active layer, tile refresh timers and background
+        tasks, and delete downloaded feature files.
 
         Called by the plugin on unload; hiding the dock deliberately keeps
         everything alive so a reopened dock resumes where it left off.
@@ -1583,15 +1648,146 @@ class GeoLensDock(QDockWidget):
             with contextlib.suppress(OSError):
                 os.unlink(path)
         self.temp_files.clear()
-        # A preview that finishes later finds nothing pending and does nothing.
+        # A task that finishes later finds nothing pending and does nothing,
+        # so a layer locked for a sync is unlocked here.
         pending, self._pending = self._pending, {}
-        for task in pending.values():
+        for key, task in pending.items():
             task.cancel()
+            self._dropped[id(task)] = task
+            layer = QgsProject.instance().mapLayer(key[1]) if key[0] == "sync" else None
+            if layer is not None:
+                layer.setReadOnly(False)
 
     def closeEvent(self, event):
         # Hiding retains in-memory API keys, baselines, and tile refresh timers.
         event.ignore()
         self.hide()
+
+
+@dataclass
+class _SyncOutcome:
+    """What `_send_edits` got done, for the dock to apply on the GUI thread."""
+
+    written: list[tuple[int, dict]] = field(default_factory=list)
+    deleted: list[int] = field(default_factory=list)
+    # (QGIS feature id, server gid, feature)
+    created: list[tuple[int, int, dict]] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
+    unaddressable: int = 0
+    replaced: bool = False
+    created_one: bool = False
+
+
+def _send_edits(outcome, client, dataset_id, table_id, updates, deletes, creates, gids):
+    """Send a sync's writes, recording in `outcome` what each one did.
+
+    It runs in a background task, so it reads no layer and changes no
+    baseline. `gids` are the server IDs in the layer's baseline. Creates
+    carry no table id, so they go last, after a guarded write or a fresh
+    read has shown the table is still the one loaded.
+    """
+    confirmed = False
+    for gid, changes, feature in updates:
+        if "geometry" in changes and changes["geometry"] is None:
+            outcome.errors.append(
+                tr(
+                    "Feature {gid} lost its geometry, which GeoLens can't "
+                    "store. Undo that edit or delete the feature."
+                ).format(gid=gid)
+            )
+            continue
+        try:
+            client.patch_feature(dataset_id, gid, changes, table_id)
+        except GeoLensError as error:
+            if _dataset_replaced(error):
+                outcome.replaced = True
+                return outcome
+            outcome.errors.append(str(error))
+            continue
+        outcome.written.append((gid, feature))
+        confirmed = True
+    for gid in deletes:
+        try:
+            client.delete_feature(dataset_id, gid, table_id)
+        except GeoLensError as error:
+            if _dataset_replaced(error):
+                outcome.replaced = True
+                return outcome
+            outcome.errors.append(str(error))
+            continue
+        outcome.deleted.append(gid)
+        confirmed = True
+    if creates and table_id and not confirmed:
+        current = _current_table_id(client, dataset_id, min(gids) if gids else None)
+        if current is None:
+            # One message per refused create keeps the failure count right.
+            outcome.errors += [
+                tr(
+                    "GeoLens couldn't confirm that the dataset is still the "
+                    "one this layer was loaded from, so new features weren't "
+                    "sent. Try again, or load the dataset again with Add "
+                    "features."
+                )
+            ] * len(creates)
+            return outcome
+        if current != table_id:
+            outcome.replaced = True
+            return outcome
+    for fid, feature in creates:
+        try:
+            gid, created_in = client.create_feature(dataset_id, feature)
+        except GeoLensError as error:
+            outcome.errors.append(str(error))
+            continue
+        if created_in and table_id and created_in != table_id:
+            outcome.replaced = outcome.created_one = True
+            return outcome
+        if gid is None:
+            # The feature exists on the server but cannot be addressed, so
+            # a second sync would create it again. The dock drops the
+            # baseline, and the layer has to be reloaded first.
+            outcome.unaddressable += 1
+            outcome.errors.append(
+                tr(
+                    "A feature was created, but GeoLens returned no integer "
+                    "ID for it. Reload the layer before synchronizing again."
+                )
+            )
+            continue
+        outcome.created.append((fid, gid, feature))
+    return outcome
+
+
+def _download_features(client, dataset_id, limit, bbox):
+    """Download a dataset for Add features, between two reads of its table id.
+
+    Returns the collection, with each feature's integer server ID copied to
+    `_geolens_gid`; how many features have none; the table ids read before
+    and after the download (after is None when sync is off anyway); and the
+    detail record.
+    """
+    probe_gid, table_before = _table_id_probe(client, dataset_id)
+    collection = client.features(dataset_id, limit, bbox)
+    gids = []
+    unidentified = 0
+    for feature in collection["features"]:
+        # GeoJSON permits "properties": null, which setdefault keeps.
+        props = feature.get("properties")
+        if not isinstance(props, dict):
+            props = {}
+            feature["properties"] = props
+        gid = feature.get("id", props.get("gid"))
+        if isinstance(gid, int) and not isinstance(gid, bool):
+            props["_geolens_gid"] = gid
+            gids.append(gid)
+        else:
+            unidentified += 1
+    table_after = None
+    if not unidentified:
+        gid = min(gids) if gids else probe_gid
+        table_after = "" if gid is None else _current_table_id(client, dataset_id, gid)
+    detail = fetch_detail(client, dataset_id)
+    return collection, unidentified, table_before, table_after, detail
 
 
 def _clean_feature(feature):

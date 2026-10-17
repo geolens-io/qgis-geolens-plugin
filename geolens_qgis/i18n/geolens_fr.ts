@@ -484,6 +484,10 @@
         <translation>Les champs supprimés ne sont pas synchronisés et GeoLens conserve leurs valeurs : {fields}.</translation>
     </message>
     <message>
+        <source>Renewing tile access: {title}</source>
+        <translation>Renouvellement de l'accès aux tuiles : {title}</translation>
+    </message>
+    <message>
         <source>Report an issue</source>
         <translation>Signaler un problème</translation>
     </message>
@@ -586,6 +590,10 @@
     <message>
         <source>Synchronizing will delete {count} server features. Continue?</source>
         <translation>La synchronisation supprimera {count} entités sur le serveur. Continuer ?</translation>
+    </message>
+    <message>
+        <source>Synchronizing {title}…</source>
+        <translation>Synchronisation de {title}…</translation>
     </message>
     <message>
         <source>Table</source>

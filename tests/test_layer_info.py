@@ -1,6 +1,7 @@
 """Layers added from GeoLens carry the dataset's catalogue metadata."""
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 from urllib.error import HTTPError
 from urllib.parse import urlparse
@@ -12,8 +13,9 @@ pytest.importorskip("pytest_qgis")
 from qgis.core import QgsProject  # noqa: E402
 from qgis.PyQt.QtCore import QSettings  # noqa: E402
 
+from dock_tasks import settle  # noqa: E402
 from geolens_qgis.client import GeoLensClient, parse_dataset  # noqa: E402
-from geolens_qgis.layer_info import apply_layer_info, build_metadata  # noqa: E402
+from geolens_qgis.layer_info import build_metadata, fetch_detail  # noqa: E402
 
 SEARCH = {
     "id": "roads",
@@ -110,14 +112,14 @@ def test_a_sparse_record_falls_back_to_the_search_result():
     assert build_metadata(licensed, {}, "u").licenses() == ["CC-BY-4.0"]
 
 
-def test_a_failed_detail_request_still_describes_the_layer(qgis_iface):
-    from qgis.core import QgsVectorLayer
-
-    layer = QgsVectorLayer("Point?crs=EPSG:4326", "x", "memory")
+def test_a_failed_detail_request_still_describes_the_layer():
     client = GeoLensClient("https://gis.example.org", opener=_opener(None))
-    apply_layer_info(layer, parse_dataset(SEARCH), client)
-    assert layer.metadata().title() == "Roads"
-    assert layer.metadata().licenses() == ["CC-BY-4.0"]
+    with ThreadPoolExecutor(1) as worker:
+        detail = worker.submit(fetch_detail, client, "roads").result()
+    assert detail == {}
+    metadata = build_metadata(parse_dataset(SEARCH), detail, "u")
+    assert metadata.title() == "Roads"
+    assert metadata.licenses() == ["CC-BY-4.0"]
 
 
 @pytest.mark.parametrize("add", ["add_tiles", "add_features"])
@@ -133,6 +135,7 @@ def test_layers_added_from_the_dock_are_described(
         dataset = parse_dataset(SEARCH)
         dock._selected_dataset = lambda: dataset
         getattr(dock, add)()
+        settle(dock)
         (layer,) = QgsProject.instance().mapLayers().values()
         assert layer.metadata().licenses() == ["OGL-3.0"]
         assert layer.metadata().keywords() == {"GeoLens": ["transport", "roads"]}

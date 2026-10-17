@@ -484,6 +484,10 @@
         <translation>Entfernte Felder werden nicht synchronisiert, und GeoLens behält ihre Werte: {fields}.</translation>
     </message>
     <message>
+        <source>Renewing tile access: {title}</source>
+        <translation>Kachelzugriff wird erneuert: {title}</translation>
+    </message>
+    <message>
         <source>Report an issue</source>
         <translation>Problem melden</translation>
     </message>
@@ -586,6 +590,10 @@
     <message>
         <source>Synchronizing will delete {count} server features. Continue?</source>
         <translation>Durch die Synchronisierung werden {count} Objekte auf dem Server gelöscht. Fortfahren?</translation>
+    </message>
+    <message>
+        <source>Synchronizing {title}…</source>
+        <translation>{title} wird synchronisiert…</translation>
     </message>
     <message>
         <source>Table</source>
