@@ -7,7 +7,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from urllib.error import HTTPError
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 from urllib.request import Request
 
 import pytest
@@ -1524,15 +1524,17 @@ def test_a_failed_connect_clears_the_previous_catalog(
 
 
 class _RecordingGeoLens(_FakeGeoLens):
-    """The fake server, plus a log of every write it receives."""
+    """The fake server, plus a log of every request it receives."""
 
     def __init__(self):
+        self.reads = []
         self.writes = []
 
     def __call__(self, request, timeout=0):
         if request.get_method() != "GET":
             self.writes.append((request.get_method(), request.full_url))
             return BytesIO(b"{}")
+        self.reads.append(request.full_url)
         return super().__call__(request, timeout)
 
 
@@ -1637,3 +1639,46 @@ def test_sync_after_reconnecting_to_the_same_server_sends_the_edit(
     finally:
         dock.cleanup()
         QgsProject.instance().clear()
+
+
+def test_add_features_in_view_sends_no_bbox_while_the_map_is_empty(
+    qgis_iface, clean_profile_settings
+):
+    from qgis.core import QgsCoordinateReferenceSystem, QgsProject, QgsRectangle
+
+    from geolens_qgis.dialogs import GeoLensDock
+
+    opener = _RecordingGeoLens()
+    dock = GeoLensDock(qgis_iface, opener=opener)
+    canvas = qgis_iface.mapCanvas()
+
+    def items_queries():
+        return [
+            parse_qs(urlparse(url).query)
+            for url in opener.reads
+            if urlparse(url).path == "/api/collections/roads/items"
+        ]
+
+    try:
+        dock.use_server("https://gis.example.org")
+        dock.connect_server()
+        settle(dock)
+        assert dock.view_only.isChecked()
+        assert canvas.extent().isNull()
+        _select(dock, "Roads")
+        dock.add_features()
+        settle(dock)
+        assert "bbox" not in items_queries()[-1]
+        assert QgsProject.instance().mapLayersByName("Roads")
+
+        canvas.setDestinationCrs(QgsCoordinateReferenceSystem("EPSG:4326"))
+        canvas.setExtent(QgsRectangle(10, 40, 12, 42))
+        dock.add_features()
+        settle(dock)
+        xmin, ymin, xmax, ymax = map(float, items_queries()[-1]["bbox"][0].split(","))
+        assert xmin <= 10 and ymin <= 40 and xmax >= 12 and ymax >= 42
+    finally:
+        dock.cleanup()
+        QgsProject.instance().clear()
+        canvas.setDestinationCrs(QgsCoordinateReferenceSystem())
+        canvas.setExtent(QgsRectangle())
