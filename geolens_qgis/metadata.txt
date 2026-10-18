@@ -4,7 +4,7 @@ qgisMinimumVersion=3.44
 qgisMaximumVersion=4.99
 description=Browse, visualize, and edit datasets hosted by a GeoLens server.
 about=Connect to public or private GeoLens catalogs. Search datasets, open metadata, add signed vector tiles, add raster XYZ tiles, or load OGC API Features as editable QGIS layers. Edited feature layers can be synchronized back to GeoLens when server-side editing is enabled.
-version=0.2.0
+version=0.2.1
 author=Qiusheng Wu, Ian Shiland
 email=support@getgeolens.com
 repository=https://github.com/geolens-io/qgis-geolens-plugin
@@ -19,6 +19,12 @@ hasProcessingProvider=no
 supportsQt6=True
 
 changelog=
+    0.2.1 - The panel no longer freezes QGIS while it waits for a GeoLens server
+        - Connecting, searching, adding layers, renewing tile links and syncing run in the background, so a slow or unreachable server no longer freezes the QGIS window
+        - The button that started a request is disabled until it finishes, and the status line says what is running
+        - The layer is read-only while a sync sends its changes. If a sync stops partway, the changes that already reached the server are recorded, so the next sync sends only the rest
+        - Add features works in a new project with nothing on the map. With "Only features in the current map extent" on, it used to fail with an HTTP 400 error
+        - "No server yet?" opens the guide to running your own GeoLens server
     0.2.0 - Saved connections, a clearer panel and safer sync. The project now lives at github.com/geolens-io/qgis-geolens-plugin
         - Requires QGIS 3.44 or later
         - Keep several saved GeoLens connections, each with its own server and authentication, with a preset for the public GeoLens demo
