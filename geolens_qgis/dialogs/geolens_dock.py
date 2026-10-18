@@ -41,7 +41,6 @@ from qgis.PyQt.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
-    QMenu,
     QMessageBox,
     QPushButton,
     QSpinBox,
@@ -108,7 +107,6 @@ SAMPLE_SERVERS = (
 )
 HELP_URL = "https://docs.getgeolens.com/guides/api/qgis/"
 INSTALL_URL = "https://docs.getgeolens.com/guides/quickstart/install/"
-PILOT_URL = "https://getgeolens.com/pilot/"
 SETTING_VIEW_ONLY = "geolens/view_only"
 MAX_THUMBNAIL_BYTES = 1_000_000
 LOG_TAG = "GeoLens"
@@ -474,17 +472,10 @@ class GeoLensDock(QDockWidget):
         self.help_button.clicked.connect(lambda *_: self._open_url(HELP_URL))
         self.no_server_button = QPushButton(tr("No server yet?"))
         self.no_server_button.setToolTip(
-            tr("Find out how to run your own GeoLens server or join the hosted pilot.")
+            tr("Find out how to run your own GeoLens server.")
         )
         self.no_server_button.setAccessibleName(tr("No server yet?"))
-        menu = QMenu(self.no_server_button)
-        menu.addAction(tr("Install GeoLens yourself")).triggered.connect(
-            lambda *_: self._open_url(INSTALL_URL)
-        )
-        menu.addAction(tr("Join the hosted pilot")).triggered.connect(
-            lambda *_: self._open_url(PILOT_URL)
-        )
-        self.no_server_button.setMenu(menu)
+        self.no_server_button.clicked.connect(lambda *_: self._open_url(INSTALL_URL))
         for button in (self.help_button, self.no_server_button):
             button.setFlat(True)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
