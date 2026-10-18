@@ -545,7 +545,7 @@ def test_metadata_opens_in_the_desktop_browser(make_dock, monkeypatch):
     assert opened == [f"{SERVER}/datasets/roads"]
 
 
-def test_footer_links_open_help_and_the_ways_to_get_a_server(make_dock, monkeypatch):
+def test_footer_links_open_help_and_the_install_page(make_dock, monkeypatch):
     opened = []
     monkeypatch.setattr(
         geolens_dock.QDesktopServices,
@@ -554,14 +554,8 @@ def test_footer_links_open_help_and_the_ways_to_get_a_server(make_dock, monkeypa
     )
     dock, _ = make_dock(connect=False)
     dock.help_button.click()
-    install, pilot = dock.no_server_button.menu().actions()
-    install.trigger()
-    pilot.trigger()
-    assert opened == [
-        geolens_dock.HELP_URL,
-        geolens_dock.INSTALL_URL,
-        geolens_dock.PILOT_URL,
-    ]
+    dock.no_server_button.click()
+    assert opened == [geolens_dock.HELP_URL, geolens_dock.INSTALL_URL]
 
 
 def test_every_control_has_a_tooltip_and_an_accessible_name(make_dock):

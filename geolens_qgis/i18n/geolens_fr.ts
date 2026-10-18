@@ -268,8 +268,8 @@
         <translation>Filtrer par type</translation>
     </message>
     <message>
-        <source>Find out how to run your own GeoLens server or join the hosted pilot.</source>
-        <translation>Découvrez comment exécuter votre propre serveur GeoLens ou rejoindre le programme pilote hébergé.</translation>
+        <source>Find out how to run your own GeoLens server.</source>
+        <translation>Découvrez comment exécuter votre propre serveur GeoLens.</translation>
     </message>
     <message>
         <source>GeoLens Catalog</source>
@@ -306,14 +306,6 @@
     <message>
         <source>Help</source>
         <translation>Aide</translation>
-    </message>
-    <message>
-        <source>Install GeoLens yourself</source>
-        <translation>Installer GeoLens vous-même</translation>
-    </message>
-    <message>
-        <source>Join the hosted pilot</source>
-        <translation>Rejoindre le programme pilote hébergé</translation>
     </message>
     <message>
         <source>Line layer</source>

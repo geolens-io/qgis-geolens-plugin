@@ -268,8 +268,8 @@
         <translation>按类型筛选</translation>
     </message>
     <message>
-        <source>Find out how to run your own GeoLens server or join the hosted pilot.</source>
-        <translation>了解如何运行自己的 GeoLens 服务器，或加入托管试点计划。</translation>
+        <source>Find out how to run your own GeoLens server.</source>
+        <translation>了解如何运行自己的 GeoLens 服务器。</translation>
     </message>
     <message>
         <source>GeoLens Catalog</source>
@@ -306,14 +306,6 @@
     <message>
         <source>Help</source>
         <translation>帮助</translation>
-    </message>
-    <message>
-        <source>Install GeoLens yourself</source>
-        <translation>自行安装 GeoLens</translation>
-    </message>
-    <message>
-        <source>Join the hosted pilot</source>
-        <translation>加入托管试点计划</translation>
     </message>
     <message>
         <source>Line layer</source>
