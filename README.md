@@ -21,7 +21,7 @@ A QGIS plugin for browsing and using datasets from a GeoLens server. It brings t
 
 ## Install
 
-In QGIS 3.44 or later, open **Plugins → Manage and Install Plugins**, search for **GeoLens** and click **Install Plugin**. Open it from **Web → GeoLens** or the toolbar. The plugin's listing is at [plugins.qgis.org](https://plugins.qgis.org/plugins/geolens_qgis/).
+In QGIS 3.44 through 4.x, open **Plugins → Manage and Install Plugins**, search for **GeoLens** and click **Install Plugin**. Open it from **Web → GeoLens** or the toolbar. The plugin's listing is at [plugins.qgis.org](https://plugins.qgis.org/plugins/geolens_qgis/).
 
 ## Install for development
 
