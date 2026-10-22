@@ -19,6 +19,10 @@ A QGIS plugin for browsing and using datasets from a GeoLens server. It brings t
 - Edit loaded feature layers in QGIS and synchronize creates, updates, and deletes back to GeoLens when the server permits editing. Sync sends only the fields you changed, stops if the dataset was re-imported on the server, and reports fields you removed instead of clearing them on the server.
 - Open the About dialog from **Web → GeoLens**. The interface is translated into Spanish, French, German and Chinese.
 
+## Install
+
+In QGIS 3.44 or later, open **Plugins → Manage and Install Plugins**, search for **GeoLens** and click **Install Plugin**. Open it from **Web → GeoLens** or the toolbar. The plugin's listing is at [plugins.qgis.org](https://plugins.qgis.org/plugins/geolens_qgis/).
+
 ## Install for development
 
 Clone the repository and link its plugin directory into your active QGIS profile:
